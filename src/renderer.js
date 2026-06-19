@@ -72,14 +72,14 @@ const state = {
 };
 
 function defaultAttentionAnchors() {
-  return [
-    { id: 'next-thread', active: true, emoji: '🧭', title: 'Open the next code thread', imagePath: null, shapePattern: null },
-    { id: 'rough-edge', active: true, emoji: '🔎', title: 'Review one rough edge', imagePath: null, shapePattern: null },
-    { id: 'tiny-fix', active: true, emoji: '✅', title: 'Ship a tiny fix', imagePath: null, shapePattern: null },
-    { id: 'write-note', active: true, emoji: '📝', title: 'Write the note down', imagePath: null, shapePattern: null },
-    { id: 'unstick-path', active: true, emoji: '🛠️', title: 'Refactor a stuck path', imagePath: null, shapePattern: null },
-    { id: 'capture-reference', active: true, emoji: '🖼️', title: 'Capture a useful image', imagePath: null, shapePattern: null },
-  ];
+  return Array.from({ length: ANCHOR_LIMIT }, (_, index) => ({
+    id: `anchor-${index + 1}`,
+    active: false,
+    emoji: '',
+    title: '',
+    imagePath: null,
+    shapePattern: null,
+  }));
 }
 
 function defaultSettings() {
@@ -140,15 +140,34 @@ function normalizeAnchors(anchors) {
   return Array.from({ length: ANCHOR_LIMIT }, (_, index) => {
     const anchor = anchors?.[index] || {};
     const fallback = defaults[index];
+    if (isLegacyDefaultAnchor(anchor, index)) return fallback;
     return {
       id: typeof anchor.id === 'string' && anchor.id ? anchor.id : fallback.id,
-      active: anchor.active !== false,
+      active: typeof anchor.active === 'boolean' ? anchor.active : fallback.active,
       emoji: typeof anchor.emoji === 'string' ? anchor.emoji.slice(0, 8) : fallback.emoji,
       title: typeof anchor.title === 'string' ? anchor.title : fallback.title,
       imagePath: typeof anchor.imagePath === 'string' && anchor.imagePath ? anchor.imagePath : null,
       shapePattern: normalizeShapePattern(anchor.shapePattern),
     };
   });
+}
+
+function isLegacyDefaultAnchor(anchor, index) {
+  const legacy = [
+    { id: 'next-thread', emoji: '🧭', title: 'Open the next code thread' },
+    { id: 'rough-edge', emoji: '🔎', title: 'Review one rough edge' },
+    { id: 'tiny-fix', emoji: '✅', title: 'Ship a tiny fix' },
+    { id: 'write-note', emoji: '📝', title: 'Write the note down' },
+    { id: 'unstick-path', emoji: '🛠️', title: 'Refactor a stuck path' },
+    { id: 'capture-reference', emoji: '🖼️', title: 'Capture a useful image' },
+  ][index];
+  if (!legacy) return false;
+  return anchor?.id === legacy.id
+    && anchor.active !== false
+    && anchor.emoji === legacy.emoji
+    && anchor.title === legacy.title
+    && !anchor.imagePath
+    && !anchor.shapePattern;
 }
 
 function normalizeShapePattern(pattern) {

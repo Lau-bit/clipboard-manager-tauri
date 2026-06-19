@@ -89,57 +89,46 @@ fn default_attention_anchors_enabled() -> bool {
 }
 
 fn default_attention_anchors() -> Vec<AttentionAnchorSettings> {
-    vec![
-        AttentionAnchorSettings {
-            id: "next-thread".to_string(),
-            active: true,
-            emoji: "🧭".to_string(),
-            title: "Open the next code thread".to_string(),
+    (1..=6)
+        .map(|index| AttentionAnchorSettings {
+            id: format!("anchor-{index}"),
+            active: false,
+            emoji: String::new(),
+            title: String::new(),
             image_path: None,
             shape_pattern: None,
-        },
-        AttentionAnchorSettings {
-            id: "rough-edge".to_string(),
-            active: true,
-            emoji: "🔎".to_string(),
-            title: "Review one rough edge".to_string(),
-            image_path: None,
-            shape_pattern: None,
-        },
-        AttentionAnchorSettings {
-            id: "tiny-fix".to_string(),
-            active: true,
-            emoji: "✅".to_string(),
-            title: "Ship a tiny fix".to_string(),
-            image_path: None,
-            shape_pattern: None,
-        },
-        AttentionAnchorSettings {
-            id: "write-note".to_string(),
-            active: true,
-            emoji: "📝".to_string(),
-            title: "Write the note down".to_string(),
-            image_path: None,
-            shape_pattern: None,
-        },
-        AttentionAnchorSettings {
-            id: "unstick-path".to_string(),
-            active: true,
-            emoji: "🛠️".to_string(),
-            title: "Refactor a stuck path".to_string(),
-            image_path: None,
-            shape_pattern: None,
-        },
-        AttentionAnchorSettings {
-            id: "capture-reference".to_string(),
-            active: true,
-            emoji: "🖼️".to_string(),
-            title: "Capture a useful image".to_string(),
-            image_path: None,
-            shape_pattern: None,
-        },
-    ]
+        })
+        .collect()
 }
+
+fn is_legacy_default_anchor(index: usize, anchor: &AttentionAnchorSettings) -> bool {
+    const IDS: [&str; 6] = [
+        "next-thread",
+        "rough-edge",
+        "tiny-fix",
+        "write-note",
+        "unstick-path",
+        "capture-reference",
+    ];
+    const EMOJIS: [&str; 6] = ["🧭", "🔎", "✅", "📝", "🛠️", "🖼️"];
+    const TITLES: [&str; 6] = [
+        "Open the next code thread",
+        "Review one rough edge",
+        "Ship a tiny fix",
+        "Write the note down",
+        "Refactor a stuck path",
+        "Capture a useful image",
+    ];
+
+    index < IDS.len()
+        && anchor.id == IDS[index]
+        && anchor.active
+        && anchor.emoji == EMOJIS[index]
+        && anchor.title == TITLES[index]
+        && anchor.image_path.is_none()
+        && anchor.shape_pattern.is_none()
+}
+
 
 // Stored in logical (scale-independent) pixels so the window restores to the same visual
 // size and place across monitors with different DPI scaling.
@@ -312,6 +301,10 @@ fn normalize_settings(mut settings: Settings) -> Settings {
     }
 
     for (index, anchor) in settings.attention_anchors.iter_mut().enumerate() {
+        if is_legacy_default_anchor(index, anchor) {
+            *anchor = defaults.attention_anchors[index].clone();
+            continue;
+        }
         if anchor.id.trim().is_empty() {
             anchor.id = defaults.attention_anchors[index].id.clone();
         }
