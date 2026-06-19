@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self' asset: http://asset.localhost;
+             style-src 'self' 'unsafe-inline';
+             script-src 'self';
+             img-src 'self' data: asset: http://asset.localhost blob:;">
+  <title>Clipboard Manager</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="titlebar">
+    <div id="title-drag" title="Drag window"></div>
+    <div id="toolbar">
+      <button id="btn-dual" class="icon-button" title="Toggle two displayers">2</button>
+      <button id="btn-mirror" class="icon-button" title="Mirror UI">⇄</button>
+      <button id="btn-topbar" class="icon-button" title="Hide top bar (Shift+Q)">▔</button>
+      <button id="btn-settings" class="icon-button" title="Settings">⚙</button>
+      <span class="divider"></span>
+      <button id="btn-minimize" class="icon-button" title="Minimize">−</button>
+      <button id="btn-close" class="icon-button" title="Close">×</button>
+    </div>
+  </div>
+
+  <div id="settings-panel" aria-hidden="true">
+    <div class="settings-header">
+      <strong>Settings</strong>
+      <button id="btn-settings-close" title="Close settings">×</button>
+    </div>
+    <label class="settings-row">
+      <input id="setting-dual-displayers" type="checkbox">
+      <span>Two image displayers</span>
+    </label>
+    <label class="settings-row">
+      <input id="setting-mirror-ui" type="checkbox">
+      <span>Mirror UI</span>
+    </label>
+    <label class="settings-row">
+      <input id="setting-hide-topbar-startup" type="checkbox">
+      <span>Hide top bar on startup</span>
+    </label>
+    <label class="settings-row">
+      <input id="setting-remember-window-position" type="checkbox">
+      <span>Remember last app position on startup</span>
+    </label>
+    <label class="settings-row">
+      <input id="setting-expand-borderless-edges" type="checkbox">
+      <span>Expand borderless edges by 2px</span>
+    </label>
+    <label class="settings-row">
+      <input id="setting-attention-anchors" type="checkbox">
+      <span>Dev work attention anchors</span>
+    </label>
+    <button id="btn-attention-anchors" class="settings-action">Attention anchors...</button>
+  </div>
+
+  <div id="hidden-drag-strip" title="Drag window"></div>
+
+  <main id="workspace">
+    <section id="displayers" aria-label="Image displayers"></section>
+
+    <section id="history-panel" aria-label="Clipboard history" tabindex="0">
+      <div id="anchor-column" aria-label="Attention anchors">
+        <div id="anchor-grid"></div>
+        <button id="btn-clear-anchors" title="Clear active attention anchors">↺</button>
+      </div>
+      <div id="history-grid"></div>
+      <button id="btn-clear" title="Clear clipboard history">↺</button>
+      <div id="empty-history">Copy text or images to fill the grid</div>
+    </section>
+  </main>
+
+  <div id="context-menu" role="menu"></div>
+
+  <div id="image-picker" class="overlay" aria-hidden="true">
+    <div id="image-picker-panel" class="overlay-panel" role="dialog" aria-label="Default image pool">
+      <div class="overlay-header">
+        <strong>Default image pool</strong>
+        <span id="image-picker-target" class="overlay-sub"></span>
+        <span class="overlay-spacer"></span>
+        <button id="btn-paste-default-image" class="overlay-add" title="Paste image from clipboard (Ctrl+V)">Paste</button>
+        <button id="btn-add-default-image" class="overlay-add">+ Add image</button>
+        <button id="btn-image-picker-close" class="overlay-close" title="Close">×</button>
+      </div>
+      <div id="image-picker-grid" class="overlay-grid"></div>
+    </div>
+  </div>
+
+  <div id="anchor-manager" class="overlay" aria-hidden="true">
+    <div id="anchor-manager-panel" class="overlay-panel" role="dialog" aria-label="Attention anchors">
+      <div class="overlay-header">
+        <strong>Attention anchors</strong>
+        <span id="anchor-manager-count" class="overlay-sub"></span>
+        <span class="overlay-spacer"></span>
+        <button id="btn-clear-active-anchors" class="overlay-add">Clear active</button>
+        <button id="btn-anchor-manager-close" class="overlay-close" title="Close">×</button>
+      </div>
+      <div id="anchor-manager-list" class="anchor-manager-list"></div>
+    </div>
+  </div>
+
+  <div id="toast" aria-live="polite"></div>
+
+  <script src="api.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

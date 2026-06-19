@@ -1,0 +1,21 @@
+[package]
+name = "clipboard-manager-tauri"
+version = "1.0.0"
+description = "Dark Tauri clipboard manager with visual displayers and attention anchors"
+edition = "2021"
+
+[lib]
+name = "clipboard_manager_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+arboard = "3.6"
+image = { version = "0.25", features = ["bmp", "gif", "ico", "jpeg", "png", "webp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+windows-sys = { version = "0.61", features = ["Win32_Graphics_Dwm", "Win32_System_DataExchange"] }

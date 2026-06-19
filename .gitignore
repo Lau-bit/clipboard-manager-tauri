@@ -1,0 +1,22 @@
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+dist/
+build/
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# Local editor and environment files
+.idea/
+.vscode/
+.env
+.env.*
+
+# Tauri bundles and installers are build artifacts.
+*.msi
+*.exe
+*.app
+*.dmg

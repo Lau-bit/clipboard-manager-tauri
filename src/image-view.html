@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self' asset: http://asset.localhost;
+             style-src 'self' 'unsafe-inline';
+             script-src 'self';
+             img-src 'self' data: asset: http://asset.localhost blob:;">
+  <title>Image</title>
+  <link rel="stylesheet" href="image-view.css">
+</head>
+<body>
+  <img id="image" draggable="false" alt="">
+
+  <div id="close-zone">
+    <button id="btn-drag" title="Drag to move" aria-label="Drag to move window">&#x2807;&#x2807;</button>
+    <button id="btn-close" title="Close">&#x2715;</button>
+  </div>
+
+  <div id="context-menu">
+    <button type="button" id="menu-copy">Copy</button>
+    <button type="button" id="menu-close">Close window</button>
+  </div>
+
+  <script src="api.js"></script>
+  <script src="image-view.js"></script>
+</body>
+</html>

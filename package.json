@@ -1,0 +1,20 @@
+{
+  "name": "clipboard-manager-tauri",
+  "version": "1.0.0",
+  "description": "Dark Tauri clipboard manager with visual displayers, image history, and persistent attention anchors",
+  "type": "module",
+  "scripts": {
+    "start": "tauri dev",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri",
+    "check": "node --check src/api.js && node --check src/renderer.js"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

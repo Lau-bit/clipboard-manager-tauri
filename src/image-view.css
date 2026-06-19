@@ -1,0 +1,126 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #0b0b0b;
+  color: #ddd;
+  font: 13px/1.4 "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+body.load-error {
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+body.load-error::before {
+  content: attr(data-error);
+}
+
+#image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  transform-origin: 0 0;
+  will-change: transform;
+  -webkit-user-drag: none;
+}
+
+body.load-error #image {
+  position: static;
+  width: auto;
+  height: auto;
+}
+
+#close-zone {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 110px;
+  height: 64px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 6px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+#close-zone:hover,
+#close-zone.keep-visible {
+  opacity: 1;
+}
+
+#close-zone button {
+  width: 26px;
+  height: 26px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 4px;
+  background: rgba(20, 20, 20, 0.85);
+  color: #eee;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+#close-zone button:hover {
+  background: #c42b1c;
+  border-color: #c42b1c;
+  color: #fff;
+}
+
+#btn-drag {
+  cursor: move;
+  letter-spacing: -2px;
+  line-height: 1;
+}
+
+#btn-drag:hover {
+  background: rgba(40, 40, 40, 0.95);
+  border-color: rgba(255, 255, 255, 0.45);
+  color: #fff;
+}
+
+#context-menu {
+  position: fixed;
+  display: none;
+  flex-direction: column;
+  min-width: 170px;
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  z-index: 10;
+}
+
+#context-menu.open {
+  display: flex;
+}
+
+#context-menu button {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: #ccc;
+  text-align: left;
+  font-size: 12px;
+  padding: 7px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+#context-menu button:hover {
+  background: #272727;
+  color: #fff;
+}
