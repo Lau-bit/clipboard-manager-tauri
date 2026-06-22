@@ -1,12 +1,17 @@
 'use strict';
 
 const HISTORY_LIMIT = 18;
-const POLL_MS = 75;
 const ZOOM_STEP = 1.1;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 12;
 const BUNDLED_DEFAULT_IMAGE = 'pyramid-source.png';
-const ANCHOR_LIMIT = 6;
+const CLIPBOARD_FALLBACK_POLL_MS = 5000;
+// Number of distinct abstract-shape styles to cycle tiles through. Anchors themselves
+// are unlimited; this only controls the visual variety of the generated shapes.
+const ANCHOR_SHAPE_VARIANTS = 6;
+const DEFAULT_ANCHOR_COUNT = 6;
+// Anchors are unlimited, but only this many may be active (shown in the column) at once.
+const MAX_ACTIVE_ANCHORS = 6;
 const ANCHORED_HISTORY_LIMIT = 12;
 
 const els = {
@@ -47,6 +52,7 @@ const els = {
   anchorManager: document.getElementById('anchor-manager'),
   anchorManagerList: document.getElementById('anchor-manager-list'),
   anchorManagerCount: document.getElementById('anchor-manager-count'),
+  btnAddAnchor: document.getElementById('btn-add-anchor'),
   btnClearActiveAnchors: document.getElementById('btn-clear-active-anchors'),
   btnAnchorManagerClose: document.getElementById('btn-anchor-manager-close'),
   toast: document.getElementById('toast'),
@@ -65,6 +71,8 @@ const state = {
   imagePickerIndex: 0,
   displayers: [],
   pollTimer: null,
+  clipboardUnlisten: null,
+  drainInFlight: false,
   saveWindowTimer: null,
   anchorSaveTimer: null,
   hiddenHistorySaveTimer: null,
@@ -72,7 +80,7 @@ const state = {
 };
 
 function defaultAttentionAnchors() {
-  return Array.from({ length: ANCHOR_LIMIT }, (_, index) => ({
+  return Array.from({ length: DEFAULT_ANCHOR_COUNT }, (_, index) => ({
     id: `anchor-${index + 1}`,
     active: false,
     emoji: '',
@@ -80,6 +88,19 @@ function defaultAttentionAnchors() {
     imagePath: null,
     shapePattern: null,
   }));
+}
+
+function blankAnchor() {
+  return { id: makeAnchorId(), active: false, emoji: '', title: '', imagePath: null, shapePattern: null };
+}
+
+function makeAnchorId() {
+  const existing = new Set((state.settings?.attentionAnchors || []).map(anchor => anchor.id));
+  let id;
+  do {
+    id = `anchor-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  } while (existing.has(id));
+  return id;
 }
 
 function defaultSettings() {
@@ -136,18 +157,27 @@ function normalizeSettings(settings) {
 }
 
 function normalizeAnchors(anchors) {
-  const defaults = defaultAttentionAnchors();
-  return Array.from({ length: ANCHOR_LIMIT }, (_, index) => {
-    const anchor = anchors?.[index] || {};
-    const fallback = defaults[index];
-    if (isLegacyDefaultAnchor(anchor, index)) return fallback;
+  if (!Array.isArray(anchors) || anchors.length === 0) {
+    return defaultAttentionAnchors();
+  }
+  const seen = new Set();
+  return anchors.map((anchor, index) => {
+    const item = anchor || {};
+    let id = typeof item.id === 'string' && item.id ? item.id : `anchor-${index + 1}`;
+    while (seen.has(id)) {
+      id = `anchor-${index + 1}-${Math.random().toString(36).slice(2, 6)}`;
+    }
+    seen.add(id);
+    if (isLegacyDefaultAnchor(item, index)) {
+      return { id, active: false, emoji: '', title: '', imagePath: null, shapePattern: null };
+    }
     return {
-      id: typeof anchor.id === 'string' && anchor.id ? anchor.id : fallback.id,
-      active: typeof anchor.active === 'boolean' ? anchor.active : fallback.active,
-      emoji: typeof anchor.emoji === 'string' ? anchor.emoji.slice(0, 8) : fallback.emoji,
-      title: typeof anchor.title === 'string' ? anchor.title : fallback.title,
-      imagePath: typeof anchor.imagePath === 'string' && anchor.imagePath ? anchor.imagePath : null,
-      shapePattern: normalizeShapePattern(anchor.shapePattern),
+      id,
+      active: typeof item.active === 'boolean' ? item.active : false,
+      emoji: typeof item.emoji === 'string' ? item.emoji.slice(0, 8) : '',
+      title: typeof item.title === 'string' ? item.title : '',
+      imagePath: typeof item.imagePath === 'string' && item.imagePath ? item.imagePath : null,
+      shapePattern: normalizeShapePattern(item.shapePattern),
     };
   });
 }
@@ -201,6 +231,10 @@ function itemUrl(item) {
   return window.clipboardAPI.assetUrl(item.filePath);
 }
 
+function itemThumbnailUrl(item) {
+  return window.clipboardAPI.assetUrl(item.thumbnailPath || item.filePath);
+}
+
 function modeLabel(mode) {
   switch (mode) {
     case 'defaultImage': return 'default image';
@@ -234,7 +268,7 @@ function activeAnchors() {
 function configuredActiveAnchors() {
   return state.settings.attentionAnchors
     .filter(anchor => anchor.active && validAnchor(anchor))
-    .slice(0, ANCHOR_LIMIT);
+    .slice(0, MAX_ACTIVE_ANCHORS);
 }
 
 function anchorColumnVisible() {
@@ -415,6 +449,7 @@ function defaultImageItem(displayer) {
   return {
     kind: 'image',
     filePath: settings.defaultImagePath || BUNDLED_DEFAULT_IMAGE,
+    thumbnailPath: null,
     bundled: !settings.defaultImagePath,
   };
 }
@@ -551,10 +586,17 @@ function showItemInClipboardDisplayers(item) {
 
 function renderHistory() {
   els.body.classList.toggle('anchors-visible', anchorColumnVisible());
-  els.body.classList.toggle('has-history', visibleHistoryItems().length > 0);
-  const fragment = document.createDocumentFragment();
-  visibleHistoryItems().forEach(item => fragment.append(createHistoryNode(item)));
-  els.historyGrid.replaceChildren(fragment);
+  const visibleItems = visibleHistoryItems();
+  els.body.classList.toggle('has-history', visibleItems.length > 0);
+  const existingNodes = new Map(
+    [...els.historyGrid.children].map(node => [node.dataset.itemId, node])
+  );
+  const nodes = visibleItems.map(item => {
+    const node = existingNodes.get(item.id) || createHistoryNode(item);
+    updateHistoryNode(node, item);
+    return node;
+  });
+  els.historyGrid.replaceChildren(...nodes);
   scheduleHiddenHistorySave();
 }
 
@@ -566,15 +608,17 @@ function renderAnchors() {
 }
 
 function createAnchorNode(anchor, index) {
-  const anchorIndex = state.settings.attentionAnchors.findIndex(item => item.id === anchor.id);
   const node = document.createElement('button');
-  node.className = `anchor-item anchor-shape-${index % ANCHOR_LIMIT}`;
+  node.className = `anchor-item anchor-shape-${index % ANCHOR_SHAPE_VARIANTS}`;
+  node.dataset.anchorId = anchor.id;
   node.classList.toggle('no-image', !anchor.imagePath);
   node.classList.toggle('selected', anchor.id === state.selectedAnchorId);
   applyShapePattern(node, anchor.shapePattern);
   node.title = [anchor.emoji, anchor.title].filter(Boolean).join(' ');
+  // Selection is updated in place (see updateAnchorSelectionClasses) rather than by
+  // rebuilding the grid, so the tile survives between the two clicks of a double-click.
+  // Double-click itself is handled by delegation on #anchor-column (see bindChrome).
   node.addEventListener('click', () => selectAnchor(anchor));
-  node.addEventListener('dblclick', event => openAnchorConfigFromTile(event, anchorIndex >= 0 ? anchorIndex : index));
 
   if (anchor.imagePath) {
     const image = document.createElement('img');
@@ -605,10 +649,10 @@ function createAnchorNode(anchor, index) {
   return node;
 }
 
-function openAnchorConfigFromTile(event, index) {
-  event.preventDefault();
-  event.stopPropagation();
-  openAnchorManager(index);
+function updateAnchorSelectionClasses() {
+  els.anchorGrid.querySelectorAll('.anchor-item').forEach(node => {
+    node.classList.toggle('selected', node.dataset.anchorId === state.selectedAnchorId);
+  });
 }
 
 function applyShapePattern(node, pattern) {
@@ -631,6 +675,7 @@ function anchorDisplayItem(anchor) {
       id: `anchor-${anchor.id}`,
       kind: 'image',
       filePath: anchor.imagePath,
+      thumbnailPath: null,
       fingerprint: `anchor-image:${anchor.id}:${anchor.imagePath}`,
     };
   }
@@ -655,24 +700,23 @@ function selectAnchor(anchor) {
     }
   });
   els.historyPanel.focus();
-  renderAnchors();
+  updateAnchorSelectionClasses();
   renderHistory();
 }
 
 function createHistoryNode(item) {
   const node = document.createElement('button');
   node.className = 'history-item';
-  node.classList.toggle('selected', item.id === state.selectedId);
-  node.title = item.kind === 'text' ? item.text || '' : `${item.width || '?'} × ${item.height || '?'}`;
+  node.dataset.itemId = item.id;
   node.addEventListener('click', () => selectItem(item));
   node.addEventListener('dblclick', event => openItemInViewer(item, event));
 
   if (item.kind === 'image') {
     const image = document.createElement('img');
     image.className = 'history-thumb';
-    image.classList.toggle('fill-width-thumb', shouldFillThumbnailWidth(item));
     image.draggable = false;
-    image.src = itemUrl(item);
+    image.decoding = 'async';
+    image.loading = 'lazy';
     node.append(image);
   } else {
     const text = document.createElement('div');
@@ -682,6 +726,27 @@ function createHistoryNode(item) {
   }
 
   return node;
+}
+
+function updateHistoryNode(node, item) {
+  node.classList.toggle('selected', item.id === state.selectedId);
+  node.title = item.kind === 'text' ? item.text || '' : `${item.width || '?'} x ${item.height || '?'}`;
+  if (item.kind === 'image') {
+    const image = node.querySelector('.history-thumb');
+    if (image) {
+      image.classList.toggle('fill-width-thumb', shouldFillThumbnailWidth(item));
+      const src = itemThumbnailUrl(item);
+      if (image.dataset.src !== src) {
+        image.dataset.src = src;
+        image.src = src;
+      }
+    }
+  } else {
+    const text = node.querySelector('.history-text');
+    if (text && text.textContent !== (item.text || '')) {
+      text.textContent = item.text || '';
+    }
+  }
 }
 
 function shouldFillThumbnailWidth(item) {
@@ -1031,13 +1096,33 @@ async function clearDisplayer(index) {
   renderDisplayers();
 }
 
-function openAnchorManager(index = state.focusedAnchorIndex) {
-  state.focusedAnchorIndex = Math.max(0, Math.min(ANCHOR_LIMIT - 1, index || 0));
+function openAnchorManager(focusAnchorId = null) {
+  reflowAnchorsActiveFirst();
+  const anchors = state.settings.attentionAnchors;
+  const lastIndex = Math.max(0, anchors.length - 1);
+  let focusIndex = state.focusedAnchorIndex;
+  if (focusAnchorId) {
+    const found = anchors.findIndex(anchor => anchor.id === focusAnchorId);
+    if (found >= 0) focusIndex = found;
+  }
+  state.focusedAnchorIndex = Math.max(0, Math.min(lastIndex, focusIndex || 0));
   state.anchorManagerOpen = true;
   setSettingsOpen(false);
   els.anchorManager.classList.add('open');
   els.anchorManager.setAttribute('aria-hidden', 'false');
   renderAnchorManager();
+}
+
+// Float active anchors to the top (stable) so the column order and the manager order
+// agree after the menu is re-opened. Persists only when the order actually changes.
+function reflowAnchorsActiveFirst() {
+  const anchors = state.settings.attentionAnchors;
+  const isActive = anchor => anchor.active && validAnchor(anchor);
+  const reordered = [...anchors.filter(isActive), ...anchors.filter(anchor => !isActive(anchor))];
+  if (reordered.some((anchor, i) => anchor !== anchors[i])) {
+    state.settings.attentionAnchors = reordered;
+    scheduleAnchorSave();
+  }
 }
 
 function closeAnchorManager() {
@@ -1046,10 +1131,15 @@ function closeAnchorManager() {
   els.anchorManager.setAttribute('aria-hidden', 'true');
 }
 
-function renderAnchorManager() {
+function updateAnchorManagerCount() {
   const activeCount = configuredActiveAnchors().length;
-  els.anchorManagerCount.textContent = `${activeCount}/${ANCHOR_LIMIT} active`;
+  const total = state.settings.attentionAnchors.length;
+  els.anchorManagerCount.textContent = `${activeCount}/${MAX_ACTIVE_ANCHORS} active · ${total} total`;
   els.btnClearActiveAnchors.disabled = activeCount === 0;
+}
+
+function renderAnchorManager() {
+  updateAnchorManagerCount();
   const rows = state.settings.attentionAnchors.map((anchor, index) => createAnchorEditor(anchor, index));
   els.anchorManagerList.replaceChildren(...rows);
 }
@@ -1058,6 +1148,7 @@ function createAnchorEditor(anchor, index) {
   const row = document.createElement('div');
   row.className = 'anchor-editor';
   row.tabIndex = 0;
+  row.dataset.anchorId = anchor.id;
   row.classList.toggle('invalid', !validAnchor(anchor));
   row.classList.toggle('focused', index === state.focusedAnchorIndex);
   row.addEventListener('pointerdown', event => {
@@ -1067,6 +1158,12 @@ function createAnchorEditor(anchor, index) {
     setFocusedAnchorIndex(index);
   });
   row.addEventListener('focus', () => setFocusedAnchorIndex(index));
+
+  const handle = document.createElement('div');
+  handle.className = 'anchor-drag-handle';
+  handle.textContent = '⠿';
+  handle.title = 'Drag to reorder';
+  handle.addEventListener('pointerdown', event => startAnchorDrag(event, row));
 
   const active = document.createElement('input');
   active.type = 'checkbox';
@@ -1078,11 +1175,16 @@ function createAnchorEditor(anchor, index) {
       showToast('Add content first');
       return;
     }
+    if (active.checked && configuredActiveAnchors().length >= MAX_ACTIVE_ANCHORS) {
+      active.checked = false;
+      showToast(`Up to ${MAX_ACTIVE_ANCHORS} anchors can be active`);
+      return;
+    }
     await updateAnchor(index, { active: active.checked }, true);
   });
 
   const shapePreview = document.createElement('div');
-  shapePreview.className = `anchor-shape-preview anchor-shape-${index % ANCHOR_LIMIT} no-image`;
+  shapePreview.className = `anchor-shape-preview anchor-shape-${index % ANCHOR_SHAPE_VARIANTS} no-image`;
   shapePreview.title = 'Current abstract shape';
   applyShapePattern(shapePreview, anchor.shapePattern);
   shapePreview.addEventListener('click', () => generateAnchorShape(index));
@@ -1153,7 +1255,13 @@ function createAnchorEditor(anchor, index) {
   remove.disabled = !anchor.imagePath;
   remove.addEventListener('click', () => updateAnchor(index, { imagePath: null }, true));
 
-  row.append(active, shapePreview, imagePreview, emoji, title, imageState, pick, paste, shape, remove);
+  const deleteAnchorBtn = document.createElement('button');
+  deleteAnchorBtn.className = 'anchor-delete';
+  deleteAnchorBtn.textContent = '🗑';
+  deleteAnchorBtn.title = 'Delete anchor';
+  deleteAnchorBtn.addEventListener('click', () => deleteAnchor(index));
+
+  row.append(handle, active, shapePreview, imagePreview, emoji, title, imageState, pick, paste, shape, remove, deleteAnchorBtn);
   return row;
 
   function refreshEditor() {
@@ -1161,9 +1269,7 @@ function createAnchorEditor(anchor, index) {
     const isValid = validAnchor(current);
     row.classList.toggle('invalid', !isValid);
     active.checked = current.active && isValid;
-    const activeCount = configuredActiveAnchors().length;
-    els.anchorManagerCount.textContent = `${activeCount}/${ANCHOR_LIMIT} active`;
-    els.btnClearActiveAnchors.disabled = activeCount === 0;
+    updateAnchorManagerCount();
   }
 }
 
@@ -1200,7 +1306,8 @@ async function generateAnchorShape(index) {
 }
 
 function setFocusedAnchorIndex(index) {
-  state.focusedAnchorIndex = Math.max(0, Math.min(ANCHOR_LIMIT - 1, index));
+  const lastIndex = Math.max(0, state.settings.attentionAnchors.length - 1);
+  state.focusedAnchorIndex = Math.max(0, Math.min(lastIndex, index));
   [...els.anchorManagerList.children].forEach((row, rowIndex) => {
     row.classList.toggle('focused', rowIndex === state.focusedAnchorIndex);
   });
@@ -1270,6 +1377,120 @@ async function pasteAnchorImage(index) {
   showToast('Image set');
 }
 
+async function addAnchor() {
+  state.settings.attentionAnchors.push(blankAnchor());
+  state.focusedAnchorIndex = state.settings.attentionAnchors.length - 1;
+  renderAnchors();
+  renderHistory();
+  await saveSettings();
+  renderAnchorManager();
+  const rows = els.anchorManagerList.children;
+  const newRow = rows[rows.length - 1];
+  if (newRow) {
+    newRow.scrollIntoView({ block: 'nearest' });
+    const titleInput = newRow.querySelector('input[type="text"]:not(.emoji-input)');
+    if (titleInput) titleInput.focus();
+  }
+}
+
+// Pointer-based drag-and-drop reordering for manager rows. The dragged row is moved
+// among its siblings as the pointer crosses each row's midpoint; holding near the top
+// or bottom edge auto-scrolls the list when there are enough rows to scroll.
+function startAnchorDrag(event, row) {
+  if (event.button != null && event.button !== 0) return;
+  event.preventDefault();
+  const list = els.anchorManagerList;
+  const EDGE = 36;
+  const SCROLL_SPEED = 9;
+  let pointerY = event.clientY;
+  let scrollDir = 0;
+  let rafId = null;
+
+  row.classList.add('dragging');
+  document.body.classList.add('anchor-dragging');
+
+  function repositionRow() {
+    const siblings = [...list.querySelectorAll('.anchor-editor')].filter(item => item !== row);
+    const before = siblings.find(item => {
+      const rect = item.getBoundingClientRect();
+      return pointerY < rect.top + rect.height / 2;
+    });
+    if (before) {
+      if (before.previousElementSibling !== row) list.insertBefore(row, before);
+    } else if (list.lastElementChild !== row) {
+      list.append(row);
+    }
+  }
+
+  function tick() {
+    if (scrollDir !== 0 && list.scrollHeight > list.clientHeight) {
+      list.scrollTop += scrollDir * SCROLL_SPEED;
+      repositionRow();
+    }
+    rafId = requestAnimationFrame(tick);
+  }
+
+  function onMove(moveEvent) {
+    pointerY = moveEvent.clientY;
+    const rect = list.getBoundingClientRect();
+    if (pointerY < rect.top + EDGE) scrollDir = -1;
+    else if (pointerY > rect.bottom - EDGE) scrollDir = 1;
+    else scrollDir = 0;
+    repositionRow();
+  }
+
+  function onUp() {
+    document.removeEventListener('pointermove', onMove);
+    document.removeEventListener('pointerup', onUp);
+    cancelAnimationFrame(rafId);
+    row.classList.remove('dragging');
+    document.body.classList.remove('anchor-dragging');
+    commitAnchorOrderFromDom(row.dataset.anchorId);
+  }
+
+  document.addEventListener('pointermove', onMove);
+  document.addEventListener('pointerup', onUp);
+  rafId = requestAnimationFrame(tick);
+}
+
+async function commitAnchorOrderFromDom(focusAnchorId = null) {
+  const ids = [...els.anchorManagerList.querySelectorAll('.anchor-editor')].map(item => item.dataset.anchorId);
+  const byId = new Map(state.settings.attentionAnchors.map(anchor => [anchor.id, anchor]));
+  const reordered = ids.map(id => byId.get(id)).filter(Boolean);
+  if (reordered.length !== state.settings.attentionAnchors.length) {
+    // DOM and state disagree (shouldn't happen) — just re-render from state.
+    renderAnchorManager();
+    return;
+  }
+  const changed = reordered.some((anchor, i) => anchor !== state.settings.attentionAnchors[i]);
+  state.settings.attentionAnchors = reordered;
+  if (focusAnchorId) {
+    const i = reordered.findIndex(anchor => anchor.id === focusAnchorId);
+    if (i >= 0) state.focusedAnchorIndex = i;
+  }
+  if (changed) {
+    renderAnchors();
+    renderHistory();
+    await saveSettings();
+  }
+  renderAnchorManager();
+}
+
+async function deleteAnchor(index) {
+  const list = state.settings.attentionAnchors;
+  const removed = list[index];
+  if (!removed) return;
+  list.splice(index, 1);
+  // Keep at least one row so the manager is never empty and an anchor can always be added.
+  if (list.length === 0) list.push(blankAnchor());
+  if (state.selectedAnchorId === removed.id) state.selectedAnchorId = null;
+  state.focusedAnchorIndex = Math.max(0, Math.min(index, list.length - 1));
+  renderAnchors();
+  renderHistory();
+  await saveSettings();
+  renderAnchorManager();
+}
+
 async function clearActiveAnchors() {
   state.settings.attentionAnchors = state.settings.attentionAnchors.map(anchor => ({
     ...anchor,
@@ -1290,15 +1511,35 @@ async function toggleDualDisplayers() {
   await saveSettings();
 }
 
-async function pollClipboard() {
+async function drainClipboardQueue() {
+  if (state.drainInFlight) return;
+  state.drainInFlight = true;
   try {
     const items = await window.clipboardAPI.drainClipboardItems();
     for (const item of items) addHistoryItem(item);
   } catch {
     // Clipboard contention is normal on Windows; the next tick gets another chance.
   } finally {
-    state.pollTimer = setTimeout(pollClipboard, POLL_MS);
+    state.drainInFlight = false;
   }
+}
+
+function scheduleClipboardFallbackDrain() {
+  clearTimeout(state.pollTimer);
+  state.pollTimer = setTimeout(async () => {
+    await drainClipboardQueue();
+    scheduleClipboardFallbackDrain();
+  }, CLIPBOARD_FALLBACK_POLL_MS);
+}
+
+async function startClipboardDrain() {
+  await drainClipboardQueue();
+  try {
+    state.clipboardUnlisten = await window.clipboardAPI.onClipboardItemsReady(drainClipboardQueue);
+  } catch {
+    // The slow fallback keeps the app functional if event wiring is unavailable.
+  }
+  scheduleClipboardFallbackDrain();
 }
 
 function setSettingsOpen(open) {
@@ -1342,6 +1583,7 @@ function bindChrome() {
     event.stopPropagation();
     openAnchorManager();
   });
+  els.btnAddAnchor.addEventListener('click', addAnchor);
   els.btnClearActiveAnchors.addEventListener('click', clearActiveAnchors);
   els.btnAnchorManagerClose.addEventListener('click', closeAnchorManager);
   els.anchorManager.addEventListener('click', event => {
@@ -1352,10 +1594,11 @@ function bindChrome() {
     clearActiveAnchors();
   });
   els.anchorColumn.addEventListener('dblclick', event => {
-    if (event.target.closest('.anchor-item, #btn-clear-anchors')) return;
+    if (event.target.closest('#btn-clear-anchors')) return;
     event.preventDefault();
     event.stopPropagation();
-    openAnchorManager();
+    const tile = event.target.closest('.anchor-item');
+    openAnchorManager(tile?.dataset.anchorId || null);
   });
   els.settingDualDisplayers.addEventListener('change', async () => {
     state.settings.dualDisplayers = els.settingDualDisplayers.checked;
@@ -1425,6 +1668,8 @@ function bindChrome() {
   window.addEventListener('blur', scheduleWindowSave);
   window.addEventListener('beforeunload', () => {
     clearTimeout(state.anchorSaveTimer);
+    clearTimeout(state.pollTimer);
+    if (typeof state.clipboardUnlisten === 'function') state.clipboardUnlisten();
     window.clipboardAPI.saveWindowState().catch(() => {});
     window.clipboardAPI.saveSettings(state.settings).catch(() => {});
   });
@@ -1527,7 +1772,7 @@ async function init() {
     await window.clipboardAPI.adjustWindowBorderlessEdges(true).catch(() => {});
     await window.clipboardAPI.saveWindowState().catch(() => {});
   }
-  pollClipboard();
+  startClipboardDrain();
 }
 
 async function start() {

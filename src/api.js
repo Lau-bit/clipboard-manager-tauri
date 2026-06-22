@@ -33,6 +33,11 @@ window.clipboardAPI = {
   saveWindowState: () => invoke('save_window_state'),
   adjustWindowBorderlessEdges: expand => invoke('adjust_window_borderless_edges', { expand }),
   drainClipboardItems: () => invoke('drain_clipboard_items'),
+  onClipboardItemsReady: handler => {
+    const listen = bridge()?.event?.listen;
+    if (!listen) return Promise.reject(new Error('Tauri event API not ready'));
+    return listen('clipboard-items-ready', handler);
+  },
   clearHistory: () => invoke('clear_history'),
   loadHiddenHistory: () => invoke('load_hidden_history'),
   saveHiddenHistory: items => invoke('save_hidden_history', { items }),

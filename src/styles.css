@@ -444,8 +444,11 @@ body.mirrored #anchor-column {
   width: 100%;
   height: 100%;
   display: grid;
-  grid-template-rows: repeat(6, minmax(0, 1fr));
+  /* Rows share the height when few anchors are active, but keep a minimum so the
+     column scrolls instead of squashing once many anchors are added. */
+  grid-auto-rows: minmax(56px, 1fr);
   gap: 3px;
+  overflow-y: auto;
 }
 
 .anchor-item {
@@ -913,11 +916,13 @@ body.mirrored.anchors-visible #empty-history {
   gap: 8px;
   padding: 10px;
   overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .anchor-editor {
   display: grid;
-  grid-template-columns: 24px 34px 34px 42px minmax(78px, 1fr) 66px 50px 50px 54px 26px;
+  grid-template-columns: 22px 24px 34px 34px 42px minmax(78px, 1fr) 66px 50px 50px 54px 26px 28px;
   align-items: center;
   gap: 8px;
   min-height: 44px;
@@ -987,6 +992,48 @@ body.mirrored.anchors-visible #empty-history {
 .anchor-remove-image {
   width: 26px;
   padding: 0;
+}
+
+.anchor-drag-handle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+  border-radius: 4px;
+}
+
+.anchor-drag-handle:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.anchor-editor.dragging {
+  cursor: grabbing;
+  opacity: 0.92;
+  border-color: rgba(46, 215, 210, 0.6);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+  background: rgba(46, 215, 210, 0.08);
+}
+
+body.anchor-dragging {
+  cursor: grabbing;
+  user-select: none;
+}
+
+.anchor-editor .anchor-delete {
+  width: 28px;
+  padding: 0;
+}
+
+.anchor-editor .anchor-delete:hover {
+  background: rgba(231, 116, 116, 0.22);
+  color: #ffd9d9;
 }
 
 .anchor-image-state {
@@ -1111,11 +1158,16 @@ body.mirrored.anchors-visible #empty-history {
   }
 
   .anchor-editor {
-    grid-template-columns: 24px 34px 34px 42px minmax(92px, 1fr);
+    grid-template-columns: 22px 24px 34px 34px 42px minmax(78px, 1fr);
   }
 
   .anchor-editor button,
   .anchor-image-state {
-    grid-column: 5;
+    grid-column: 6;
+  }
+
+  .anchor-drag-handle {
+    grid-column: 1;
+    grid-row: 1;
   }
 }

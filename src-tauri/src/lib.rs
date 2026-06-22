@@ -1,7 +1,7 @@
 use arboard::{Clipboard, ImageData};
 use image::{
     codecs::png::{CompressionType, FilterType, PngEncoder},
-    ColorType, ImageEncoder, ImageFormat, ImageReader,
+    imageops, ColorType, ImageEncoder, ImageFormat, ImageReader, RgbaImage,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,7 +19,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
-    utils::config::Color, AppHandle, LogicalPosition, LogicalSize, Manager, Position, Size,
+    utils::config::Color, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Position, Size,
     WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 
@@ -34,6 +34,15 @@ const SETTINGS_FILE: &str = "settings.json";
 const HIDDEN_HISTORY_FILE: &str = "attention-anchor-hidden-history.json";
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "ico"];
 const HISTORY_LIMIT: usize = 18;
+const HISTORY_THUMB_MAX_EDGE: u32 = 360;
+// Newest clipboard cache files to keep on disk. A fresh PNG (and sometimes a thumbnail) is written
+// for every clipboard change, but only the most recent ~18 items are ever shown. Without trimming,
+// the cache grows without bound across a long-running session (days of sleep/wake with no restart),
+// and every stale file stays a distinct asset URL the WebView2 image cache holds a decoded bitmap
+// for — which is what eventually drives the webview out of memory. The startup wipe only helps if
+// the app is actually restarted, so trim continuously as items arrive. The limit comfortably covers
+// the visible (<=18) plus hidden (6) history, each using at most an image plus a thumbnail.
+const HISTORY_CACHE_FILE_LIMIT: usize = 96;
 const BORDERLESS_EDGE_EXPAND: i32 = 1;
 const CLIPBOARD_COPY_ATTEMPTS: usize = 6;
 const CLIPBOARD_COPY_RETRY_DELAY: Duration = Duration::from_millis(35);
@@ -199,6 +208,7 @@ struct ClipboardItem {
     kind: String,
     text: Option<String>,
     file_path: Option<String>,
+    thumbnail_path: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     fingerprint: String,
@@ -240,6 +250,8 @@ struct WindowBounds {
 
 struct AppState {
     pending_items: Mutex<VecDeque<ClipboardItem>>,
+    ignored_sequences: Mutex<VecDeque<u32>>,
+    own_clipboard_write_active: AtomicBool,
     window_shown: AtomicBool,
     image_window_counter: AtomicUsize,
     /// Floating image window label -> source file path.
@@ -252,6 +264,8 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             pending_items: Mutex::new(VecDeque::new()),
+            ignored_sequences: Mutex::new(VecDeque::new()),
+            own_clipboard_write_active: AtomicBool::new(false),
             window_shown: AtomicBool::new(false),
             image_window_counter: AtomicUsize::new(0),
             image_paths: Mutex::new(HashMap::new()),
@@ -281,12 +295,11 @@ fn normalize_settings(mut settings: Settings) -> Settings {
             .push(defaults.displayers[settings.displayers.len()].clone());
     }
     settings.displayers.truncate(2);
-    while settings.attention_anchors.len() < 6 {
-        settings
-            .attention_anchors
-            .push(defaults.attention_anchors[settings.attention_anchors.len()].clone());
+    // Anchors are unlimited; only seed the default set when none exist. Never truncate —
+    // the UI allows creating arbitrarily many anchors.
+    if settings.attention_anchors.is_empty() {
+        settings.attention_anchors = defaults.attention_anchors.clone();
     }
-    settings.attention_anchors.truncate(6);
 
     for displayer in &mut settings.displayers {
         if !matches!(
@@ -306,7 +319,7 @@ fn normalize_settings(mut settings: Settings) -> Settings {
             continue;
         }
         if anchor.id.trim().is_empty() {
-            anchor.id = defaults.attention_anchors[index].id.clone();
+            anchor.id = format!("anchor-{}", index + 1);
         }
         if anchor.emoji.chars().count() > 8 {
             anchor.emoji = anchor.emoji.chars().take(8).collect();
@@ -371,6 +384,66 @@ fn cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .join(HISTORY_CACHE_DIR))
 }
 
+fn write_rgba_png(path: &Path, width: u32, height: u32, bytes: &[u8]) -> Result<(), String> {
+    let file =
+        File::create(path).map_err(|error| format!("Failed to create image file: {error}"))?;
+    let encoder = PngEncoder::new_with_quality(file, CompressionType::Fast, FilterType::NoFilter);
+    encoder
+        .write_image(bytes, width, height, ColorType::Rgba8.into())
+        .map_err(|error| format!("Failed to save image: {error}"))
+}
+
+fn thumbnail_path_for(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("clip");
+    path.with_file_name(format!("{stem}-thumb.png"))
+}
+
+fn save_thumbnail_from_rgba(
+    path: &Path,
+    width: u32,
+    height: u32,
+    bytes: &[u8],
+) -> Result<Option<String>, String> {
+    if width <= HISTORY_THUMB_MAX_EDGE && height <= HISTORY_THUMB_MAX_EDGE {
+        return Ok(None);
+    }
+    let Some(image) = RgbaImage::from_raw(width, height, bytes.to_vec()) else {
+        return Ok(None);
+    };
+    let thumb = imageops::thumbnail(&image, HISTORY_THUMB_MAX_EDGE, HISTORY_THUMB_MAX_EDGE);
+    let thumb_path = thumbnail_path_for(path);
+    write_rgba_png(&thumb_path, thumb.width(), thumb.height(), thumb.as_raw())?;
+    Ok(Some(thumb_path.to_string_lossy().to_string()))
+}
+
+fn save_thumbnail_from_file(
+    app: &AppHandle,
+    source: &Path,
+    sequence: u32,
+    created_at: u128,
+) -> Result<Option<String>, String> {
+    let image = ImageReader::open(source)
+        .map_err(|error| format!("Failed to open clipboard image file: {error}"))?
+        .with_guessed_format()
+        .map_err(|error| format!("Failed to detect clipboard image format: {error}"))?
+        .decode()
+        .map_err(|error| format!("Failed to decode clipboard image: {error}"))?
+        .to_rgba8();
+    if image.width() <= HISTORY_THUMB_MAX_EDGE && image.height() <= HISTORY_THUMB_MAX_EDGE {
+        return Ok(None);
+    }
+    let dir = cache_dir(app)?;
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create clipboard image cache: {error}"))?;
+    let thumb = imageops::thumbnail(&image, HISTORY_THUMB_MAX_EDGE, HISTORY_THUMB_MAX_EDGE);
+    let path = dir.join(format!("clip-file-{sequence}-{created_at}-thumb.png"));
+    write_rgba_png(&path, thumb.width(), thumb.height(), thumb.as_raw())?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
 fn default_images_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app
         .path()
@@ -384,6 +457,37 @@ fn clean_history_cache(app: &AppHandle) {
         if dir.exists() {
             let _ = fs::remove_dir_all(dir);
         }
+    }
+}
+
+/// Keep the clipboard cache bounded while the app runs: delete all but the newest
+/// `HISTORY_CACHE_FILE_LIMIT` files. Called on every capture so a long-lived session never
+/// accumulates an unbounded set of cached images (and the asset URLs the webview caches for them).
+fn trim_history_cache(app: &AppHandle) {
+    let Ok(dir) = cache_dir(app) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    let mut files: Vec<(SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .collect();
+    if files.len() <= HISTORY_CACHE_FILE_LIMIT {
+        return;
+    }
+    // Newest first, then drop everything past the keep window.
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in files.into_iter().skip(HISTORY_CACHE_FILE_LIMIT) {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -438,12 +542,10 @@ fn image_item_from_rgba_with_timestamp(
         .map_err(|error| format!("Failed to create clipboard image cache: {error}"))?;
 
     let path = dir.join(format!("clip-{sequence}-{created_at}.png"));
-    let file = File::create(&path)
-        .map_err(|error| format!("Failed to create clipboard image file: {error}"))?;
-    let encoder = PngEncoder::new_with_quality(file, CompressionType::Fast, FilterType::NoFilter);
-    encoder
-        .write_image(&bytes, width_u32, height_u32, ColorType::Rgba8.into())
-        .map_err(|error| format!("Failed to save clipboard image: {error}"))?;
+    write_rgba_png(&path, width_u32, height_u32, &bytes)?;
+    let thumbnail_path = save_thumbnail_from_rgba(&path, width_u32, height_u32, &bytes)
+        .ok()
+        .flatten();
 
     let fingerprint = format!("image:{width}x{height}:{}", hash_value(&bytes));
     Ok(ClipboardItem {
@@ -451,6 +553,7 @@ fn image_item_from_rgba_with_timestamp(
         kind: "image".to_string(),
         text: None,
         file_path: Some(path.to_string_lossy().to_string()),
+        thumbnail_path,
         width: Some(width_u32),
         height: Some(height_u32),
         fingerprint,
@@ -467,6 +570,7 @@ fn text_item(sequence: u32, created_at: u128, text: String) -> Option<ClipboardI
         kind: "text".to_string(),
         text: Some(text.clone()),
         file_path: None,
+        thumbnail_path: None,
         width: None,
         height: None,
         fingerprint: format!("text:{}:{}", text.len(), hash_value(&text)),
@@ -474,7 +578,11 @@ fn text_item(sequence: u32, created_at: u128, text: String) -> Option<ClipboardI
     })
 }
 
-fn image_item_from_file(file_path: PathBuf, sequence: u32) -> Result<ClipboardItem, String> {
+fn image_item_from_file(
+    app: &AppHandle,
+    file_path: PathBuf,
+    sequence: u32,
+) -> Result<ClipboardItem, String> {
     let reader = ImageReader::open(&file_path)
         .map_err(|error| format!("Failed to open clipboard image file: {error}"))?
         .with_guessed_format()
@@ -489,6 +597,9 @@ fn image_item_from_file(file_path: PathBuf, sequence: u32) -> Result<ClipboardIt
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
     let created_at = now_ms();
+    let thumbnail_path = save_thumbnail_from_file(app, &file_path, sequence, created_at)
+        .ok()
+        .flatten();
     let fingerprint = format!(
         "image-file:{}:{}:{}x{}",
         file_path.to_string_lossy(),
@@ -502,6 +613,7 @@ fn image_item_from_file(file_path: PathBuf, sequence: u32) -> Result<ClipboardIt
         kind: "image".to_string(),
         text: None,
         file_path: Some(file_path.to_string_lossy().to_string()),
+        thumbnail_path,
         width: Some(dimensions.0),
         height: Some(dimensions.1),
         fingerprint,
@@ -522,12 +634,12 @@ fn read_clipboard_image(app: &AppHandle, sequence: u32) -> Option<ClipboardItem>
     .ok()
 }
 
-fn read_clipboard_file_image(sequence: u32) -> Option<ClipboardItem> {
+fn read_clipboard_file_image(app: &AppHandle, sequence: u32) -> Option<ClipboardItem> {
     let files = Clipboard::new().ok()?.get().file_list().ok()?;
     files
         .into_iter()
         .find(|path| path.is_file() && is_image_path(path))
-        .and_then(|path| image_item_from_file(path, sequence).ok())
+        .and_then(|path| image_item_from_file(app, path, sequence).ok())
 }
 
 fn read_clipboard_text(sequence: u32) -> Option<ClipboardItem> {
@@ -538,19 +650,23 @@ fn read_clipboard_text(sequence: u32) -> Option<ClipboardItem> {
 
 fn read_clipboard_item(app: &AppHandle, sequence: u32) -> Option<ClipboardItem> {
     read_clipboard_image(app, sequence)
-        .or_else(|| read_clipboard_file_image(sequence))
+        .or_else(|| read_clipboard_file_image(app, sequence))
         .or_else(|| read_clipboard_text(sequence))
 }
 
-fn raw_file_image_from_paths(paths: Vec<PathBuf>, sequence: u32) -> Option<RawClipboardItem> {
+fn raw_file_image_from_paths(
+    app: &AppHandle,
+    paths: Vec<PathBuf>,
+    sequence: u32,
+) -> Option<RawClipboardItem> {
     paths
         .into_iter()
         .find(|path| path.is_file() && is_image_path(path))
-        .and_then(|path| image_item_from_file(path, sequence).ok())
+        .and_then(|path| image_item_from_file(app, path, sequence).ok())
         .map(RawClipboardItem::FileImage)
 }
 
-fn read_clipboard_raw(sequence: u32) -> Result<Option<RawClipboardItem>, ()> {
+fn read_clipboard_raw(app: &AppHandle, sequence: u32) -> Result<Option<RawClipboardItem>, ()> {
     let mut clipboard = Clipboard::new().map_err(|_| ())?;
     let created_at = now_ms();
 
@@ -565,7 +681,7 @@ fn read_clipboard_raw(sequence: u32) -> Result<Option<RawClipboardItem>, ()> {
     }
 
     if let Ok(paths) = clipboard.get().file_list() {
-        if let Some(item) = raw_file_image_from_paths(paths, sequence) {
+        if let Some(item) = raw_file_image_from_paths(app, paths, sequence) {
             return Ok(Some(item));
         }
     }
@@ -610,6 +726,34 @@ fn push_pending_item(app: &AppHandle, item: ClipboardItem) {
             pending.pop_front();
         }
     };
+    trim_history_cache(app);
+    let _ = app.emit("clipboard-items-ready", ());
+}
+
+fn remember_own_clipboard_sequence(app: &AppHandle) {
+    let sequence = clipboard_sequence();
+    if sequence == 0 {
+        return;
+    }
+    let state = app.state::<AppState>();
+    if let Ok(mut ignored) = state.ignored_sequences.lock() {
+        ignored.push_back(sequence);
+        while ignored.len() > 16 {
+            ignored.pop_front();
+        }
+    };
+}
+
+fn take_ignored_clipboard_sequence(app: &AppHandle, sequence: u32) -> bool {
+    let state = app.state::<AppState>();
+    let Ok(mut ignored) = state.ignored_sequences.lock() else {
+        return false;
+    };
+    if let Some(index) = ignored.iter().position(|value| *value == sequence) {
+        ignored.remove(index);
+        return true;
+    }
+    false
 }
 
 fn process_raw_clipboard_items(app: AppHandle, receiver: Receiver<RawClipboardItem>) {
@@ -631,7 +775,16 @@ fn start_clipboard_watcher(app: AppHandle) {
         loop {
             let sequence = clipboard_sequence();
             if sequence != 0 && sequence != last_sequence {
-                match read_clipboard_raw(sequence) {
+                let state = app.state::<AppState>();
+                if state.own_clipboard_write_active.load(Ordering::SeqCst)
+                    || take_ignored_clipboard_sequence(&app, sequence)
+                {
+                    last_sequence = sequence;
+                    thread::sleep(std::time::Duration::from_millis(45));
+                    continue;
+                }
+
+                match read_clipboard_raw(&app, sequence) {
                     Ok(item) => {
                         if let Some(item) = item {
                             let _ = sender.send(item);
@@ -967,21 +1120,33 @@ fn read_clipboard(
 
 #[tauri::command]
 fn copy_item_to_clipboard(
+    app: AppHandle,
     kind: String,
     text: Option<String>,
     file_path: Option<String>,
 ) -> Result<(), String> {
-    match kind.as_str() {
-        "text" => {
-            let text = text.ok_or_else(|| "No text content was supplied.".to_string())?;
-            copy_text_to_clipboard(text)
-        }
-        "image" => {
-            let file_path = file_path.ok_or_else(|| "No image path was supplied.".to_string())?;
-            copy_image_to_clipboard(Path::new(&file_path))
-        }
+    let state = app.state::<AppState>();
+    state
+        .own_clipboard_write_active
+        .store(true, Ordering::SeqCst);
+    let result = match kind.as_str() {
+        "text" => match text {
+            Some(text) => copy_text_to_clipboard(text),
+            None => Err("No text content was supplied.".to_string()),
+        },
+        "image" => match file_path {
+            Some(file_path) => copy_image_to_clipboard(Path::new(&file_path)),
+            None => Err("No image path was supplied.".to_string()),
+        },
         _ => Err("Unsupported clipboard item type.".to_string()),
+    };
+    state
+        .own_clipboard_write_active
+        .store(false, Ordering::SeqCst);
+    if result.is_ok() {
+        remember_own_clipboard_sequence(&app);
     }
+    result
 }
 
 #[tauri::command]
