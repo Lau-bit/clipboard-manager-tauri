@@ -189,6 +189,66 @@ button {
   color: #ffffff;
 }
 
+.preview-bias-row {
+  justify-content: space-between;
+}
+
+.preview-bias {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.preview-bias.disabled {
+  opacity: 0.4;
+}
+
+.preview-bias-middle {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.preview-bias button {
+  width: 22px;
+  height: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.045);
+  color: #d7d7d7;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.preview-bias button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+  color: #ffffff;
+}
+
+.preview-bias button.active {
+  border-color: rgba(46, 215, 210, 0.72);
+  color: var(--accent);
+}
+
+.preview-bias button:disabled {
+  cursor: default;
+}
+
+#preview-bias-display {
+  min-width: 26px;
+  text-align: center;
+  font-size: 11px;
+  color: #bcbcbc;
+  cursor: pointer;
+  user-select: none;
+}
+
+#preview-bias-letter {
+  color: var(--accent);
+}
+
 #hidden-drag-strip {
   display: none;
 }
@@ -707,15 +767,20 @@ body.mirrored #anchor-column {
 .history-thumb {
   width: 100%;
   height: 100%;
-  object-fit: contain;
+  /* scale-down = the smaller of `none` and `contain`: large images shrink to fit, but small
+     images stay at their natural size instead of being upscaled (and blurred) to fill. */
+  object-fit: scale-down;
+  object-position: center center;
   padding: 0;
   -webkit-user-drag: none;
 }
 
-.history-thumb.fill-width-thumb {
-  object-fit: cover;
-  object-position: center center;
-  transform: scale(1.16);
+/* Opt-in fill mode. The safe fallback is still scale-down (never upscales) — applyThumbBias
+   upgrades a thumbnail to cover-crop only once it confirms the image is big enough to fill
+   without enlarging, and sets the bias object-position inline. This way any state where the JS
+   hasn't run yet (not laid out / not loaded) never warps a small image by blowing it up. */
+body.previews-fill .history-thumb {
+  object-fit: scale-down;
 }
 
 .history-text {

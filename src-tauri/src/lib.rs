@@ -24,9 +24,21 @@ use tauri::{
 };
 
 #[cfg(windows)]
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+#[cfg(windows)]
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 #[cfg(windows)]
-use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
+use windows_sys::Win32::System::DataExchange::{
+    AddClipboardFormatListener, GetClipboardSequenceNumber,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+#[cfg(windows)]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
+    PostQuitMessage, RegisterClassW, SetWindowLongPtrW, TranslateMessage, GWLP_USERDATA,
+    HWND_MESSAGE, MSG, WM_CLIPBOARDUPDATE, WM_DESTROY, WNDCLASSW,
+};
 
 const HISTORY_CACHE_DIR: &str = "clipboard-history";
 const DEFAULTS_DIR: &str = "default-images";
@@ -35,6 +47,10 @@ const HIDDEN_HISTORY_FILE: &str = "attention-anchor-hidden-history.json";
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "ico"];
 const HISTORY_LIMIT: usize = 18;
 const HISTORY_THUMB_MAX_EDGE: u32 = 360;
+// Largest "fill bias" nudge accepted for the history-thumbnail fill mode. The amount is in
+// source-image pixels (each step shifts the cover crop 1px of the image); the per-thumbnail
+// renderer clamps it to whatever crop room each image actually has, so this is just a sane cap.
+const THUMBNAIL_FILL_BIAS_MAX: u32 = 4000;
 // Newest clipboard cache files to keep on disk. A fresh PNG (and sometimes a thumbnail) is written
 // for every clipboard change, but only the most recent ~18 items are ever shown. Without trimming,
 // the cache grows without bound across a long-running session (days of sleep/wake with no restart),
@@ -46,6 +62,11 @@ const HISTORY_CACHE_FILE_LIMIT: usize = 96;
 const BORDERLESS_EDGE_EXPAND: i32 = 1;
 const CLIPBOARD_COPY_ATTEMPTS: usize = 6;
 const CLIPBOARD_COPY_RETRY_DELAY: Duration = Duration::from_millis(35);
+// A clipboard-changed notification can arrive while the app that made the change still holds
+// the clipboard open, so a read can briefly fail. Retry a few times before giving up on a
+// revision (there is no periodic re-poll to fall back on anymore).
+const CLIPBOARD_READ_ATTEMPTS: usize = 6;
+const CLIPBOARD_READ_RETRY_DELAY: Duration = Duration::from_millis(20);
 
 #[cfg(windows)]
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
@@ -169,6 +190,17 @@ struct Settings {
     attention_anchors_enabled: bool,
     #[serde(default = "default_attention_anchors")]
     attention_anchors: Vec<AttentionAnchorSettings>,
+    // History thumbnails ("small clipboard previews"): off shows each preview at natural size
+    // (never upscaled); on fills the cell by cover-cropping, with an optional directional bias.
+    #[serde(default)]
+    thumbnail_zoom_to_fill: bool,
+    #[serde(default)]
+    thumbnail_fill_bias_direction: String,
+    #[serde(default)]
+    thumbnail_fill_bias_amount: u32,
+    // Pan portrait-shaped previews' cover crop toward the top (faces) instead of centering.
+    #[serde(default = "default_true")]
+    portrait_top_bias: bool,
     dual_displayers: bool,
     active_displayer: usize,
     max_history: usize,
@@ -192,6 +224,10 @@ impl Default for Settings {
             expand_borderless_edges: false,
             attention_anchors_enabled: true,
             attention_anchors: default_attention_anchors(),
+            thumbnail_zoom_to_fill: false,
+            thumbnail_fill_bias_direction: String::new(),
+            thumbnail_fill_bias_amount: 0,
+            portrait_top_bias: true,
             dual_displayers: false,
             active_displayer: 0,
             max_history: HISTORY_LIMIT,
@@ -213,13 +249,6 @@ struct ClipboardItem {
     height: Option<u32>,
     fingerprint: String,
     created_at: u128,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClipboardReadResult {
-    sequence: u32,
-    item: Option<ClipboardItem>,
 }
 
 #[derive(Debug)]
@@ -337,6 +366,21 @@ fn normalize_settings(mut settings: Settings) -> Settings {
     }
     settings.max_history = HISTORY_LIMIT;
 
+    if !matches!(
+        settings.thumbnail_fill_bias_direction.as_str(),
+        "L" | "R" | "U" | "D"
+    ) {
+        settings.thumbnail_fill_bias_direction = String::new();
+    }
+    settings.thumbnail_fill_bias_amount = settings
+        .thumbnail_fill_bias_amount
+        .min(THUMBNAIL_FILL_BIAS_MAX);
+    if settings.thumbnail_fill_bias_direction.is_empty() {
+        settings.thumbnail_fill_bias_amount = 0;
+    } else if settings.thumbnail_fill_bias_amount == 0 {
+        settings.thumbnail_fill_bias_direction = String::new();
+    }
+
     settings
 }
 
@@ -393,6 +437,19 @@ fn write_rgba_png(path: &Path, width: u32, height: u32, bytes: &[u8]) -> Result<
         .map_err(|error| format!("Failed to save image: {error}"))
 }
 
+/// Largest size that fits within `max_edge` on both sides while preserving aspect ratio.
+/// `imageops::thumbnail` resizes to the *exact* dimensions it's given (it does NOT keep aspect),
+/// so passing a square target squashes non-square images — always feed it these fitted dims.
+fn thumbnail_dimensions(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
+    if width <= max_edge && height <= max_edge {
+        return (width.max(1), height.max(1));
+    }
+    let scale = f64::from(max_edge) / f64::from(width.max(height));
+    let scaled_width = (f64::from(width) * scale).round() as u32;
+    let scaled_height = (f64::from(height) * scale).round() as u32;
+    (scaled_width.max(1), scaled_height.max(1))
+}
+
 fn thumbnail_path_for(path: &Path) -> PathBuf {
     let stem = path
         .file_stem()
@@ -413,7 +470,8 @@ fn save_thumbnail_from_rgba(
     let Some(image) = RgbaImage::from_raw(width, height, bytes.to_vec()) else {
         return Ok(None);
     };
-    let thumb = imageops::thumbnail(&image, HISTORY_THUMB_MAX_EDGE, HISTORY_THUMB_MAX_EDGE);
+    let (thumb_w, thumb_h) = thumbnail_dimensions(width, height, HISTORY_THUMB_MAX_EDGE);
+    let thumb = imageops::thumbnail(&image, thumb_w, thumb_h);
     let thumb_path = thumbnail_path_for(path);
     write_rgba_png(&thumb_path, thumb.width(), thumb.height(), thumb.as_raw())?;
     Ok(Some(thumb_path.to_string_lossy().to_string()))
@@ -438,7 +496,8 @@ fn save_thumbnail_from_file(
     let dir = cache_dir(app)?;
     fs::create_dir_all(&dir)
         .map_err(|error| format!("Failed to create clipboard image cache: {error}"))?;
-    let thumb = imageops::thumbnail(&image, HISTORY_THUMB_MAX_EDGE, HISTORY_THUMB_MAX_EDGE);
+    let (thumb_w, thumb_h) = thumbnail_dimensions(image.width(), image.height(), HISTORY_THUMB_MAX_EDGE);
+    let thumb = imageops::thumbnail(&image, thumb_w, thumb_h);
     let path = dir.join(format!("clip-file-{sequence}-{created_at}-thumb.png"));
     write_rgba_png(&path, thumb.width(), thumb.height(), thumb.as_raw())?;
     Ok(Some(path.to_string_lossy().to_string()))
@@ -510,16 +569,6 @@ fn clipboard_sequence() -> u32 {
 #[cfg(not(windows))]
 fn clipboard_sequence() -> u32 {
     0
-}
-
-fn image_item_from_rgba(
-    app: &AppHandle,
-    sequence: u32,
-    width: usize,
-    height: usize,
-    bytes: Vec<u8>,
-) -> Result<ClipboardItem, String> {
-    image_item_from_rgba_with_timestamp(app, sequence, now_ms(), width, height, bytes)
 }
 
 fn image_item_from_rgba_with_timestamp(
@@ -619,39 +668,6 @@ fn image_item_from_file(
         fingerprint,
         created_at,
     })
-}
-
-fn read_clipboard_image(app: &AppHandle, sequence: u32) -> Option<ClipboardItem> {
-    let mut clipboard = Clipboard::new().ok()?;
-    let image = clipboard.get_image().ok()?;
-    image_item_from_rgba(
-        app,
-        sequence,
-        image.width,
-        image.height,
-        image.bytes.into_owned(),
-    )
-    .ok()
-}
-
-fn read_clipboard_file_image(app: &AppHandle, sequence: u32) -> Option<ClipboardItem> {
-    let files = Clipboard::new().ok()?.get().file_list().ok()?;
-    files
-        .into_iter()
-        .find(|path| path.is_file() && is_image_path(path))
-        .and_then(|path| image_item_from_file(app, path, sequence).ok())
-}
-
-fn read_clipboard_text(sequence: u32) -> Option<ClipboardItem> {
-    let mut clipboard = Clipboard::new().ok()?;
-    let text = clipboard.get_text().ok()?;
-    text_item(sequence, now_ms(), text)
-}
-
-fn read_clipboard_item(app: &AppHandle, sequence: u32) -> Option<ClipboardItem> {
-    read_clipboard_image(app, sequence)
-        .or_else(|| read_clipboard_file_image(app, sequence))
-        .or_else(|| read_clipboard_text(sequence))
 }
 
 fn raw_file_image_from_paths(
@@ -769,36 +785,158 @@ fn start_clipboard_watcher(app: AppHandle) {
     let worker_app = app.clone();
 
     thread::spawn(move || process_raw_clipboard_items(worker_app, receiver));
+    thread::spawn(move || clipboard_watch_loop(app, sender));
+}
 
-    thread::spawn(move || {
-        let mut last_sequence = 0u32;
-        loop {
-            let sequence = clipboard_sequence();
-            if sequence != 0 && sequence != last_sequence {
-                let state = app.state::<AppState>();
-                if state.own_clipboard_write_active.load(Ordering::SeqCst)
-                    || take_ignored_clipboard_sequence(&app, sequence)
-                {
-                    last_sequence = sequence;
-                    thread::sleep(std::time::Duration::from_millis(45));
-                    continue;
+/// Read the current clipboard revision once and forward it, retrying briefly through transient
+/// read failures (another process can still hold the clipboard open right after it changed).
+/// `last_sequence` is updated so the same revision is never captured twice.
+fn capture_clipboard_revision(
+    app: &AppHandle,
+    sender: &mpsc::Sender<RawClipboardItem>,
+    last_sequence: &mut u32,
+) {
+    let sequence = clipboard_sequence();
+    if sequence == 0 || sequence == *last_sequence {
+        return;
+    }
+
+    let state = app.state::<AppState>();
+    if state.own_clipboard_write_active.load(Ordering::SeqCst)
+        || take_ignored_clipboard_sequence(app, sequence)
+    {
+        *last_sequence = sequence;
+        return;
+    }
+
+    for attempt in 0..CLIPBOARD_READ_ATTEMPTS {
+        match read_clipboard_raw(app, sequence) {
+            Ok(item) => {
+                if let Some(item) = item {
+                    let _ = sender.send(item);
                 }
-
-                match read_clipboard_raw(&app, sequence) {
-                    Ok(item) => {
-                        if let Some(item) = item {
-                            let _ = sender.send(item);
-                        }
-                        last_sequence = sequence;
-                    }
-                    Err(()) => {
-                        thread::sleep(std::time::Duration::from_millis(20));
-                    }
+                *last_sequence = sequence;
+                return;
+            }
+            Err(()) => {
+                if attempt + 1 < CLIPBOARD_READ_ATTEMPTS {
+                    thread::sleep(CLIPBOARD_READ_RETRY_DELAY);
                 }
             }
-            thread::sleep(std::time::Duration::from_millis(45));
         }
-    });
+    }
+    // Still locked after every attempt; skip this revision rather than spin.
+    *last_sequence = sequence;
+}
+
+#[cfg(windows)]
+struct ClipboardListenerContext {
+    app: AppHandle,
+    sender: mpsc::Sender<RawClipboardItem>,
+    last_sequence: u32,
+}
+
+/// Event-driven clipboard capture: a hidden message-only window subscribes via
+/// `AddClipboardFormatListener` and wakes only on `WM_CLIPBOARDUPDATE`. This replaces the old
+/// fixed-interval poll so the app uses no CPU while the clipboard is idle — important for a
+/// passive, always-on app.
+#[cfg(windows)]
+fn clipboard_watch_loop(app: AppHandle, sender: mpsc::Sender<RawClipboardItem>) {
+    let class_name: Vec<u16> = "ClipboardManagerClipboardListener\0"
+        .encode_utf16()
+        .collect();
+
+    unsafe {
+        let hinstance = GetModuleHandleW(std::ptr::null());
+
+        let mut wnd_class: WNDCLASSW = std::mem::zeroed();
+        wnd_class.lpfnWndProc = Some(clipboard_wndproc);
+        wnd_class.hInstance = hinstance;
+        wnd_class.lpszClassName = class_name.as_ptr();
+        RegisterClassW(&wnd_class);
+
+        let hwnd = CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            class_name.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            std::ptr::null_mut(),
+            hinstance,
+            std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            return;
+        }
+
+        let context = Box::new(ClipboardListenerContext {
+            app,
+            sender,
+            last_sequence: 0,
+        });
+        let context = Box::into_raw(context);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, context as isize);
+
+        if AddClipboardFormatListener(hwnd) == 0 {
+            // Could not subscribe; drop the context and bail. The window stays inert.
+            drop(Box::from_raw(context));
+            return;
+        }
+
+        // Capture whatever is already on the clipboard at launch (no update event fires for it).
+        capture_clipboard_revision(
+            &(*context).app,
+            &(*context).sender,
+            &mut (*context).last_sequence,
+        );
+
+        let mut message: MSG = std::mem::zeroed();
+        while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+
+        // The pump only ends on WM_QUIT, which this app never posts; reclaim the context anyway.
+        drop(Box::from_raw(context));
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn clipboard_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CLIPBOARDUPDATE => {
+            let context =
+                GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ClipboardListenerContext;
+            if let Some(context) = context.as_mut() {
+                capture_clipboard_revision(
+                    &context.app,
+                    &context.sender,
+                    &mut context.last_sequence,
+                );
+            }
+            0
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+#[cfg(not(windows))]
+fn clipboard_watch_loop(_app: AppHandle, _sender: mpsc::Sender<RawClipboardItem>) {
+    // Clipboard capture is Windows-only (it relies on the Win32 clipboard sequence number and
+    // change notifications). On other platforms the watcher is inert.
 }
 
 fn clipboard_retry_delay() {
@@ -1100,25 +1238,6 @@ fn load_hidden_history(app: AppHandle) -> Result<Vec<ClipboardItem>, String> {
 }
 
 #[tauri::command]
-fn read_clipboard(
-    app: AppHandle,
-    last_sequence: Option<u32>,
-) -> Result<ClipboardReadResult, String> {
-    let sequence = clipboard_sequence();
-    if last_sequence == Some(sequence) {
-        return Ok(ClipboardReadResult {
-            sequence,
-            item: None,
-        });
-    }
-
-    Ok(ClipboardReadResult {
-        sequence,
-        item: read_clipboard_item(&app, sequence),
-    })
-}
-
-#[tauri::command]
 fn copy_item_to_clipboard(
     app: AppHandle,
     kind: String,
@@ -1140,12 +1259,15 @@ fn copy_item_to_clipboard(
         },
         _ => Err("Unsupported clipboard item type.".to_string()),
     };
-    state
-        .own_clipboard_write_active
-        .store(false, Ordering::SeqCst);
+    // Record our own write's sequence number *before* clearing the in-progress flag, so the
+    // listener can never observe a window where the flag is down but the sequence isn't yet
+    // ignored — which would make it re-capture the item we just copied.
     if result.is_ok() {
         remember_own_clipboard_sequence(&app);
     }
+    state
+        .own_clipboard_write_active
+        .store(false, Ordering::SeqCst);
     result
 }
 
@@ -1529,7 +1651,6 @@ pub fn run() {
             load_settings,
             open_image_window,
             paste_default_image,
-            read_clipboard,
             remove_default_image,
             save_image_as_default,
             save_hidden_history,

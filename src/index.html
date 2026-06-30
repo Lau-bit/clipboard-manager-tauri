@@ -39,6 +39,26 @@
       <span>Mirror UI</span>
     </label>
     <label class="settings-row">
+      <input id="setting-thumbnail-fill" type="checkbox">
+      <span>Zoom small previews to fill cell</span>
+    </label>
+    <label class="settings-row">
+      <input id="setting-portrait-top-bias" type="checkbox">
+      <span>Focus portraits on top (faces)</span>
+    </label>
+    <div class="settings-row preview-bias-row">
+      <span>Fill bias</span>
+      <div id="preview-bias-control" class="preview-bias">
+        <button type="button" data-bias-direction="L" title="Bias left">L</button>
+        <div class="preview-bias-middle">
+          <button type="button" data-bias-direction="U" title="Bias up">U</button>
+          <span id="preview-bias-display" title="Reset bias"><span id="preview-bias-letter">·</span><span id="preview-bias-value">0</span></span>
+          <button type="button" data-bias-direction="D" title="Bias down">D</button>
+        </div>
+        <button type="button" data-bias-direction="R" title="Bias right">R</button>
+      </div>
+    </div>
+    <label class="settings-row">
       <input id="setting-hide-topbar-startup" type="checkbox">
       <span>Hide top bar on startup</span>
     </label>

@@ -13,6 +13,20 @@ const DEFAULT_ANCHOR_COUNT = 6;
 // Anchors are unlimited, but only this many may be active (shown in the column) at once.
 const MAX_ACTIVE_ANCHORS = 6;
 const ANCHORED_HISTORY_LIMIT = 12;
+// History-thumbnail "fill bias": each nudge shifts the cover crop by 1px of the source image,
+// computed per thumbnail (see applyThumbBias). The amount is stored in source-image pixels and
+// clamped per image to its available crop room. Press-and-hold auto-repeats since 1px is tiny.
+const PREVIEW_BIAS_MAX = 4000;
+const PREVIEW_BIAS_HOLD_DELAY_MS = 280;
+const PREVIEW_BIAS_REPEAT_MS = 1000 / 30;
+// Portrait "focus on face" auto-bias (mirrors super-image-viewer): images meaningfully taller
+// than their cell get their cover crop panned up toward the top, where faces usually sit.
+const PORTRAIT_MIN_ASPECT = 1.02;
+const PORTRAIT_FACE_SAFE_PAN = 0.78;
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
 
 const els = {
   body: document.body,
@@ -33,6 +47,11 @@ const els = {
   settingRememberWindowPosition: document.getElementById('setting-remember-window-position'),
   settingExpandBorderlessEdges: document.getElementById('setting-expand-borderless-edges'),
   settingAttentionAnchors: document.getElementById('setting-attention-anchors'),
+  settingThumbnailFill: document.getElementById('setting-thumbnail-fill'),
+  settingPortraitTopBias: document.getElementById('setting-portrait-top-bias'),
+  previewBiasControl: document.getElementById('preview-bias-control'),
+  previewBiasLetter: document.getElementById('preview-bias-letter'),
+  previewBiasValue: document.getElementById('preview-bias-value'),
   btnAttentionAnchors: document.getElementById('btn-attention-anchors'),
   displayers: document.getElementById('displayers'),
   historyPanel: document.getElementById('history-panel'),
@@ -77,6 +96,9 @@ const state = {
   anchorSaveTimer: null,
   hiddenHistorySaveTimer: null,
   toastTimer: null,
+  previewBiasSaveTimer: null,
+  previewBiasHoldTimer: null,
+  previewBiasRepeatTimer: null,
 };
 
 function defaultAttentionAnchors() {
@@ -112,6 +134,10 @@ function defaultSettings() {
     expandBorderlessEdges: false,
     attentionAnchorsEnabled: true,
     attentionAnchors: defaultAttentionAnchors(),
+    thumbnailZoomToFill: false,
+    thumbnailFillBiasDirection: '',
+    thumbnailFillBiasAmount: 0,
+    portraitTopBias: true,
     dualDisplayers: false,
     activeDisplayer: 0,
     maxHistory: HISTORY_LIMIT,
@@ -153,6 +179,19 @@ function normalizeSettings(settings) {
   next.expandBorderlessEdges = !!next.expandBorderlessEdges;
   next.attentionAnchorsEnabled = next.attentionAnchorsEnabled !== false;
   next.attentionAnchors = normalizeAnchors(settings?.attentionAnchors || base.attentionAnchors);
+  next.thumbnailZoomToFill = !!next.thumbnailZoomToFill;
+  next.thumbnailFillBiasDirection = ['L', 'R', 'U', 'D'].includes(next.thumbnailFillBiasDirection)
+    ? next.thumbnailFillBiasDirection
+    : '';
+  next.thumbnailFillBiasAmount = Math.max(
+    0,
+    Math.min(PREVIEW_BIAS_MAX, Math.round(Number(next.thumbnailFillBiasAmount) || 0))
+  );
+  if (!next.thumbnailFillBiasDirection || next.thumbnailFillBiasAmount === 0) {
+    next.thumbnailFillBiasDirection = '';
+    next.thumbnailFillBiasAmount = 0;
+  }
+  next.portraitTopBias = next.portraitTopBias !== false;
   return next;
 }
 
@@ -346,6 +385,152 @@ function applySettingsClasses() {
   els.settingRememberWindowPosition.checked = state.settings.rememberWindowPosition;
   els.settingExpandBorderlessEdges.checked = state.settings.expandBorderlessEdges;
   els.settingAttentionAnchors.checked = state.settings.attentionAnchorsEnabled;
+  applyPreviewFillSettings();
+}
+
+function applyPreviewFillSettings() {
+  const fill = !!state.settings.thumbnailZoomToFill;
+  els.body.classList.toggle('previews-fill', fill);
+  if (els.settingThumbnailFill) els.settingThumbnailFill.checked = fill;
+  if (els.settingPortraitTopBias) {
+    els.settingPortraitTopBias.checked = !!state.settings.portraitTopBias;
+    els.settingPortraitTopBias.disabled = !fill;
+  }
+  if (els.previewBiasControl) {
+    els.previewBiasControl.classList.toggle('disabled', !fill);
+    const direction = state.settings.thumbnailFillBiasDirection;
+    const amount = state.settings.thumbnailFillBiasAmount || 0;
+    if (els.previewBiasLetter) els.previewBiasLetter.textContent = direction || '·';
+    if (els.previewBiasValue) els.previewBiasValue.textContent = String(amount);
+    els.previewBiasControl
+      .querySelectorAll('[data-bias-direction]')
+      .forEach(button => {
+        button.disabled = !fill;
+        button.classList.toggle('active', fill && direction === button.dataset.biasDirection);
+      });
+  }
+  applyAllThumbBias();
+}
+
+// Position one thumbnail's cover crop. Two contributions, both in rendered pixels (so 1 source
+// px = `scale` rendered px): the manual fill bias on its axis, plus an automatic upward pan for
+// portrait-shaped images so faces aren't cropped off in the small preview. Each axis is clamped
+// to that image's available crop room.
+function applyThumbBias(image) {
+  if (!image) return;
+  image.style.objectPosition = '';
+  image.style.objectFit = '';
+  if (!state.settings.thumbnailZoomToFill) return;
+
+  const natW = image.naturalWidth;
+  const natH = image.naturalHeight;
+  const boxW = image.clientWidth;
+  const boxH = image.clientHeight;
+  // Not laid out / not loaded yet — the load and resize handlers will call back.
+  if (!natW || !natH || !boxW || !boxH) return;
+
+  const scale = Math.max(boxW / natW, boxH / natH); // rendered px per source px (cover)
+  // Filling a cell larger than the image would mean upscaling it (blurry/"warped"). Never do
+  // that: leave such images at the scale-down fallback. Only images already big enough to fill
+  // without enlarging get cover-cropped.
+  if (scale > 1) return;
+  image.style.objectFit = 'cover';
+  const maxX = (natW * scale - boxW) / 2; // half the horizontal overflow (max shift from center)
+  const maxY = (natH * scale - boxH) / 2;
+
+  const direction = state.settings.thumbnailFillBiasDirection;
+  const userShift = (state.settings.thumbnailFillBiasAmount || 0) * scale;
+  let offsetX = 0;
+  let offsetY = 0;
+  // Manual bias: +x reveals the left edge, +y reveals the top edge.
+  if (direction === 'L') offsetX = userShift;
+  else if (direction === 'R') offsetX = -userShift;
+  else if (direction === 'U') offsetY = userShift;
+  else if (direction === 'D') offsetY = -userShift;
+
+  // Auto portrait top-focus: a portrait image cover-cropped in a near-square cell loses both
+  // head and feet; pan the crop up so the face survives. Only when the image is meaningfully
+  // taller than its cell (otherwise there's nothing portrait to correct).
+  if (state.settings.portraitTopBias && maxY > 0.5) {
+    const imageAspect = natH / natW;
+    const cellAspect = boxH / boxW;
+    if (imageAspect > Math.max(PORTRAIT_MIN_ASPECT, cellAspect * 1.05)) {
+      offsetY += maxY * PORTRAIT_FACE_SAFE_PAN;
+    }
+  }
+
+  offsetX = clamp(offsetX, -maxX, maxX);
+  offsetY = clamp(offsetY, -maxY, maxY);
+  if (Math.abs(offsetX) < 0.5 && Math.abs(offsetY) < 0.5) return;
+  image.style.objectPosition = `${axisExpr(offsetX)} ${axisExpr(offsetY)}`;
+}
+
+function axisExpr(offset) {
+  if (Math.abs(offset) < 0.5) return '50%';
+  return offset >= 0 ? `calc(50% + ${offset}px)` : `calc(50% - ${Math.abs(offset)}px)`;
+}
+
+function applyAllThumbBias() {
+  els.historyGrid.querySelectorAll('.history-thumb').forEach(applyThumbBias);
+}
+
+// Nudge the single-axis fill bias by 1px toward `direction` (mirrors super-image-viewer: one
+// active direction with an amount). The opposite direction backs it off; reaching zero clears.
+function nudgePreviewBias(direction) {
+  if (!state.settings.thumbnailZoomToFill) return;
+  const opposite = { L: 'R', R: 'L', U: 'D', D: 'U' };
+  let current = state.settings.thumbnailFillBiasDirection;
+  let amount = state.settings.thumbnailFillBiasAmount || 0;
+  if (current === direction) {
+    amount = Math.min(PREVIEW_BIAS_MAX, amount + 1);
+  } else if (current === opposite[direction]) {
+    amount -= 1;
+    if (amount <= 0) {
+      amount = 0;
+      current = '';
+    }
+  } else {
+    current = direction;
+    amount = 1;
+  }
+  if (amount === 0) current = '';
+  state.settings.thumbnailFillBiasDirection = current;
+  state.settings.thumbnailFillBiasAmount = amount;
+  applyPreviewFillSettings();
+  schedulePreviewBiasSave();
+}
+
+function resetPreviewBias() {
+  if (!state.settings.thumbnailFillBiasDirection && !state.settings.thumbnailFillBiasAmount) return;
+  state.settings.thumbnailFillBiasDirection = '';
+  state.settings.thumbnailFillBiasAmount = 0;
+  applyPreviewFillSettings();
+  schedulePreviewBiasSave();
+}
+
+// Debounced: press-and-hold can fire many nudges/second, but each settings save round-trips to
+// disk. Persist once the nudging settles.
+function schedulePreviewBiasSave() {
+  clearTimeout(state.previewBiasSaveTimer);
+  state.previewBiasSaveTimer = setTimeout(() => {
+    saveSettings().catch(() => {});
+  }, 300);
+}
+
+function startPreviewBiasRepeat(direction) {
+  stopPreviewBiasRepeat();
+  if (!state.settings.thumbnailZoomToFill) return;
+  nudgePreviewBias(direction);
+  state.previewBiasHoldTimer = setTimeout(() => {
+    state.previewBiasRepeatTimer = setInterval(() => nudgePreviewBias(direction), PREVIEW_BIAS_REPEAT_MS);
+  }, PREVIEW_BIAS_HOLD_DELAY_MS);
+}
+
+function stopPreviewBiasRepeat() {
+  clearTimeout(state.previewBiasHoldTimer);
+  clearInterval(state.previewBiasRepeatTimer);
+  state.previewBiasHoldTimer = null;
+  state.previewBiasRepeatTimer = null;
 }
 
 function createDisplayer(index) {
@@ -717,6 +902,8 @@ function createHistoryNode(item) {
     image.draggable = false;
     image.decoding = 'async';
     image.loading = 'lazy';
+    // Natural size is unknown until load, so (re)apply the per-image bias once it's available.
+    image.addEventListener('load', () => applyThumbBias(image));
     node.append(image);
   } else {
     const text = document.createElement('div');
@@ -734,12 +921,13 @@ function updateHistoryNode(node, item) {
   if (item.kind === 'image') {
     const image = node.querySelector('.history-thumb');
     if (image) {
-      image.classList.toggle('fill-width-thumb', shouldFillThumbnailWidth(item));
+      // Fill vs. natural-size is a global mode (body.previews-fill), so no per-thumb class here.
       const src = itemThumbnailUrl(item);
       if (image.dataset.src !== src) {
         image.dataset.src = src;
         image.src = src;
       }
+      applyThumbBias(image);
     }
   } else {
     const text = node.querySelector('.history-text');
@@ -747,11 +935,6 @@ function updateHistoryNode(node, item) {
       text.textContent = item.text || '';
     }
   }
-}
-
-function shouldFillThumbnailWidth(item) {
-  if (!item?.width || !item?.height) return false;
-  return item.width >= 320 && item.width / item.height >= 0.65;
 }
 
 function selectedItem() {
@@ -1537,9 +1720,10 @@ async function startClipboardDrain() {
   try {
     state.clipboardUnlisten = await window.clipboardAPI.onClipboardItemsReady(drainClipboardQueue);
   } catch {
-    // The slow fallback keeps the app functional if event wiring is unavailable.
+    // Event wiring is unavailable — fall back to slow polling so the app still works.
+    // In the normal case the backend pushes an event on every capture, so no idle timer runs.
+    scheduleClipboardFallbackDrain();
   }
-  scheduleClipboardFallbackDrain();
 }
 
 function setSettingsOpen(open) {
@@ -1612,6 +1796,31 @@ function bindChrome() {
     applySettingsClasses();
     await saveSettings();
   });
+  els.settingThumbnailFill.addEventListener('change', async () => {
+    state.settings.thumbnailZoomToFill = els.settingThumbnailFill.checked;
+    applyPreviewFillSettings();
+    await saveSettings();
+    showToast(state.settings.thumbnailZoomToFill ? 'Previews fill their cell' : 'Previews shown at natural size');
+  });
+  els.settingPortraitTopBias.addEventListener('change', async () => {
+    state.settings.portraitTopBias = els.settingPortraitTopBias.checked;
+    applyPreviewFillSettings();
+    await saveSettings();
+    showToast(state.settings.portraitTopBias ? 'Portraits focus on top (faces)' : 'Portraits centered');
+  });
+  els.previewBiasControl.addEventListener('pointerdown', event => {
+    const button = event.target.closest('[data-bias-direction]');
+    if (button && !button.disabled) {
+      event.preventDefault();
+      startPreviewBiasRepeat(button.dataset.biasDirection);
+    }
+  });
+  els.previewBiasControl.addEventListener('click', event => {
+    if (event.target.closest('#preview-bias-display')) resetPreviewBias();
+  });
+  els.previewBiasControl.addEventListener('pointerleave', stopPreviewBiasRepeat);
+  document.addEventListener('pointerup', stopPreviewBiasRepeat);
+  document.addEventListener('pointercancel', stopPreviewBiasRepeat);
   els.settingHideTopbarStartup.addEventListener('change', async () => {
     state.settings.hideTopbarOnStartup = els.settingHideTopbarStartup.checked;
     await saveSettings();
@@ -1665,6 +1874,8 @@ function bindChrome() {
     setSettingsOpen(false);
   });
   window.addEventListener('resize', scheduleWindowSave);
+  // Cell size changes with the window, so the per-image px bias has to be recomputed.
+  window.addEventListener('resize', applyAllThumbBias);
   window.addEventListener('blur', scheduleWindowSave);
   window.addEventListener('beforeunload', () => {
     clearTimeout(state.anchorSaveTimer);
