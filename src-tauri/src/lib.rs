@@ -45,21 +45,35 @@ const DEFAULTS_DIR: &str = "default-images";
 const SETTINGS_FILE: &str = "settings.json";
 const HIDDEN_HISTORY_FILE: &str = "attention-anchor-hidden-history.json";
 const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp", "ico"];
-const HISTORY_LIMIT: usize = 18;
+// The clipboard history grid always has a fixed 6 rows; the frontend's column setting (1-5)
+// is what actually determines how many items are visible at once (columns * rows).
+const HISTORY_ROWS: usize = 6;
+const HISTORY_COLUMNS_MIN: u32 = 1;
+const HISTORY_COLUMNS_MAX: u32 = 5;
+const HISTORY_COLUMNS_DEFAULT: u32 = 3;
+// Max items ever retained/sent to the frontend, across every possible column choice, so
+// raising the column count later doesn't need to wait for fresh clipboard captures.
+const HISTORY_LIMIT: usize = HISTORY_COLUMNS_MAX as usize * HISTORY_ROWS;
 const HISTORY_THUMB_MAX_EDGE: u32 = 360;
 // Largest "fill bias" nudge accepted for the history-thumbnail fill mode. The amount is in
 // source-image pixels (each step shifts the cover crop 1px of the image); the per-thumbnail
 // renderer clamps it to whatever crop room each image actually has, so this is just a sane cap.
 const THUMBNAIL_FILL_BIAS_MAX: u32 = 4000;
 // Newest clipboard cache files to keep on disk. A fresh PNG (and sometimes a thumbnail) is written
-// for every clipboard change, but only the most recent ~18 items are ever shown. Without trimming,
+// for every clipboard change, but only the most recent ~30 items are ever shown. Without trimming,
 // the cache grows without bound across a long-running session (days of sleep/wake with no restart),
 // and every stale file stays a distinct asset URL the WebView2 image cache holds a decoded bitmap
 // for — which is what eventually drives the webview out of memory. The startup wipe only helps if
 // the app is actually restarted, so trim continuously as items arrive. The limit comfortably covers
-// the visible (<=18) plus hidden (6) history, each using at most an image plus a thumbnail.
+// the visible (<=30) plus hidden (6) history, each using at most an image plus a thumbnail.
 const HISTORY_CACHE_FILE_LIMIT: usize = 96;
 const BORDERLESS_EDGE_EXPAND: i32 = 1;
+// Native window minimum width. With the displayers column showing, it needs room for that
+// column's own 200px minimum plus a usable history grid; with displayers disabled, only the
+// history grid needs to fit, so the window can narrow much further.
+const MIN_WINDOW_WIDTH_WITH_DISPLAYERS: f64 = 520.0;
+const MIN_WINDOW_WIDTH_WITHOUT_DISPLAYERS: f64 = 260.0;
+const MIN_WINDOW_HEIGHT: f64 = 360.0;
 const CLIPBOARD_COPY_ATTEMPTS: usize = 6;
 const CLIPBOARD_COPY_RETRY_DELAY: Duration = Duration::from_millis(35);
 // A clipboard-changed notification can arrive while the app that made the change still holds
@@ -175,6 +189,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_history_columns() -> u32 {
+    HISTORY_COLUMNS_DEFAULT
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Settings {
@@ -201,6 +219,14 @@ struct Settings {
     // Pan portrait-shaped previews' cover crop toward the top (faces) instead of centering.
     #[serde(default = "default_true")]
     portrait_top_bias: bool,
+    // How many columns the clipboard history grid is arranged into (rows are derived from
+    // this so the same fixed number of history slots always fits, see `HISTORY_COLUMNS_*`).
+    #[serde(default = "default_history_columns")]
+    history_columns: u32,
+    // Whether the image displayers column shows at all. Off lets the window narrow past the
+    // width the displayers column would otherwise require (see `apply_window_min_size`).
+    #[serde(default = "default_true")]
+    displayers_enabled: bool,
     dual_displayers: bool,
     active_displayer: usize,
     max_history: usize,
@@ -228,6 +254,8 @@ impl Default for Settings {
             thumbnail_fill_bias_direction: String::new(),
             thumbnail_fill_bias_amount: 0,
             portrait_top_bias: true,
+            history_columns: HISTORY_COLUMNS_DEFAULT,
+            displayers_enabled: true,
             dual_displayers: false,
             active_displayer: 0,
             max_history: HISTORY_LIMIT,
@@ -365,6 +393,9 @@ fn normalize_settings(mut settings: Settings) -> Settings {
         settings.active_displayer = 0;
     }
     settings.max_history = HISTORY_LIMIT;
+    settings.history_columns = settings
+        .history_columns
+        .clamp(HISTORY_COLUMNS_MIN, HISTORY_COLUMNS_MAX);
 
     if !matches!(
         settings.thumbnail_fill_bias_direction.as_str(),
@@ -1053,6 +1084,23 @@ fn window_bounds_from_state(state: &WindowState) -> WindowBounds {
     }
 }
 
+/// Relax (or restore) the native minimum window width to match whether the displayers column
+/// is showing. This only changes the *constraint*; it never resizes the window itself, so
+/// disabling displayers makes a smaller window possible without forcing one.
+fn apply_window_min_size(window: &WebviewWindow, displayers_enabled: bool) -> Result<(), String> {
+    let width = if displayers_enabled {
+        MIN_WINDOW_WIDTH_WITH_DISPLAYERS
+    } else {
+        MIN_WINDOW_WIDTH_WITHOUT_DISPLAYERS
+    };
+    window
+        .set_min_size(Some(Size::Logical(LogicalSize {
+            width,
+            height: MIN_WINDOW_HEIGHT,
+        })))
+        .map_err(|error| format!("Failed to set window minimum size: {error}"))
+}
+
 #[cfg(windows)]
 fn square_window_corners(window: &WebviewWindow) {
     let Ok(hwnd) = window.hwnd() else {
@@ -1180,6 +1228,14 @@ fn save_window_state(
 fn window_show(window: WebviewWindow, state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.window_shown.store(true, Ordering::SeqCst);
     window.show().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_displayers_enabled_window_constraint(
+    window: WebviewWindow,
+    enabled: bool,
+) -> Result<(), String> {
+    apply_window_min_size(&window, enabled)
 }
 
 #[tauri::command]
@@ -1598,6 +1654,7 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 square_window_corners(&window);
                 let settings = load_settings_inner(app.handle());
+                let _ = apply_window_min_size(&window, settings.displayers_enabled);
                 if settings.remember_window_position {
                     if let Some(bounds) = settings.window {
                         let _ =
@@ -1656,6 +1713,7 @@ pub fn run() {
             save_hidden_history,
             save_settings,
             save_window_state,
+            set_displayers_enabled_window_constraint,
             window_close,
             window_minimize,
             window_show,

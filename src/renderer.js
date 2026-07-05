@@ -1,6 +1,5 @@
 'use strict';
 
-const HISTORY_LIMIT = 18;
 const ZOOM_STEP = 1.1;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 12;
@@ -12,7 +11,17 @@ const ANCHOR_SHAPE_VARIANTS = 6;
 const DEFAULT_ANCHOR_COUNT = 6;
 // Anchors are unlimited, but only this many may be active (shown in the column) at once.
 const MAX_ACTIVE_ANCHORS = 6;
-const ANCHORED_HISTORY_LIMIT = 12;
+// The clipboard history grid always has a fixed 6 rows; the user picks how many columns
+// (1-5), which is what actually determines how many items are visible at once (columns * 6).
+// When the anchor column is showing, it eats one column's worth of width, so the effective
+// column count (and therefore capacity) drops by 1, floored at 1 (see effectiveHistoryColumns).
+const HISTORY_ROWS = 6;
+const HISTORY_COLUMNS_MIN = 1;
+const HISTORY_COLUMNS_MAX = 5;
+const HISTORY_COLUMNS_DEFAULT = 3;
+// Max items ever retained in state.history, across every possible column choice, so raising
+// the column count later doesn't need to wait for fresh clipboard captures to catch up.
+const HISTORY_LIMIT = HISTORY_COLUMNS_MAX * HISTORY_ROWS;
 // History-thumbnail "fill bias": each nudge shifts the cover crop by 1px of the source image,
 // computed per thumbnail (see applyThumbBias). The amount is stored in source-image pixels and
 // clamped per image to its available crop room. Press-and-hold auto-repeats since 1px is tiny.
@@ -33,6 +42,7 @@ const els = {
   titleDrag: document.getElementById('title-drag'),
   hiddenDragStrip: document.getElementById('hidden-drag-strip'),
   toolbar: document.getElementById('toolbar'),
+  btnDisplayers: document.getElementById('btn-displayers'),
   btnDual: document.getElementById('btn-dual'),
   btnMirror: document.getElementById('btn-mirror'),
   btnTopbar: document.getElementById('btn-topbar'),
@@ -41,6 +51,7 @@ const els = {
   btnMinimize: document.getElementById('btn-minimize'),
   btnClose: document.getElementById('btn-close'),
   settingsPanel: document.getElementById('settings-panel'),
+  settingDisplayersEnabled: document.getElementById('setting-displayers-enabled'),
   settingDualDisplayers: document.getElementById('setting-dual-displayers'),
   settingMirrorUi: document.getElementById('setting-mirror-ui'),
   settingHideTopbarStartup: document.getElementById('setting-hide-topbar-startup'),
@@ -49,6 +60,7 @@ const els = {
   settingAttentionAnchors: document.getElementById('setting-attention-anchors'),
   settingThumbnailFill: document.getElementById('setting-thumbnail-fill'),
   settingPortraitTopBias: document.getElementById('setting-portrait-top-bias'),
+  historyColumnsControl: document.getElementById('history-columns-control'),
   previewBiasControl: document.getElementById('preview-bias-control'),
   previewBiasLetter: document.getElementById('preview-bias-letter'),
   previewBiasValue: document.getElementById('preview-bias-value'),
@@ -138,6 +150,8 @@ function defaultSettings() {
     thumbnailFillBiasDirection: '',
     thumbnailFillBiasAmount: 0,
     portraitTopBias: true,
+    historyColumns: HISTORY_COLUMNS_DEFAULT,
+    displayersEnabled: true,
     dualDisplayers: false,
     activeDisplayer: 0,
     maxHistory: HISTORY_LIMIT,
@@ -192,6 +206,12 @@ function normalizeSettings(settings) {
     next.thumbnailFillBiasAmount = 0;
   }
   next.portraitTopBias = next.portraitTopBias !== false;
+  next.historyColumns = clamp(
+    Math.round(Number(next.historyColumns) || HISTORY_COLUMNS_DEFAULT),
+    HISTORY_COLUMNS_MIN,
+    HISTORY_COLUMNS_MAX
+  );
+  next.displayersEnabled = next.displayersEnabled !== false;
   return next;
 }
 
@@ -314,12 +334,31 @@ function anchorColumnVisible() {
   return !!state.settings?.attentionAnchorsEnabled;
 }
 
+// Columns actually available to the history grid right now: the anchor column's width
+// squeeze costs exactly one column's worth of room off the user's chosen count.
+function effectiveHistoryColumns() {
+  const columns = state.settings.historyColumns || HISTORY_COLUMNS_DEFAULT;
+  return anchorColumnVisible() ? Math.max(HISTORY_COLUMNS_MIN, columns - 1) : columns;
+}
+
+// Capacity with the anchor column showing, regardless of whether it's showing right now —
+// used to find the boundary between "still visible with anchors on" and "pushed into the
+// hidden-history buffer" (see hiddenHistoryItems/restoreHiddenHistory).
+function anchorVisibleSlotCount() {
+  const columns = state.settings.historyColumns || HISTORY_COLUMNS_DEFAULT;
+  return Math.max(HISTORY_COLUMNS_MIN, columns - 1) * HISTORY_ROWS;
+}
+
+function fullSlotCount() {
+  return (state.settings.historyColumns || HISTORY_COLUMNS_DEFAULT) * HISTORY_ROWS;
+}
+
 function visibleHistoryItems() {
-  return state.history.slice(0, anchorColumnVisible() ? ANCHORED_HISTORY_LIMIT : HISTORY_LIMIT);
+  return state.history.slice(0, effectiveHistoryColumns() * HISTORY_ROWS);
 }
 
 function hiddenHistoryItems() {
-  return state.history.slice(ANCHORED_HISTORY_LIMIT, HISTORY_LIMIT);
+  return state.history.slice(anchorVisibleSlotCount(), fullSlotCount());
 }
 
 function scheduleHiddenHistorySave() {
@@ -348,9 +387,9 @@ async function restoreHiddenHistory() {
   });
   if (!restored.length) return;
 
-  const head = state.history.slice(0, ANCHORED_HISTORY_LIMIT);
-  const tail = state.history.slice(ANCHORED_HISTORY_LIMIT);
-  state.history = [...head, ...restored, ...tail].slice(0, HISTORY_LIMIT);
+  const head = state.history.slice(0, anchorVisibleSlotCount());
+  const tail = state.history.slice(anchorVisibleSlotCount());
+  state.history = [...head, ...restored, ...tail].slice(0, fullSlotCount());
 }
 
 function scheduleWindowSave() {
@@ -371,20 +410,26 @@ function saveWindowSoonAfterDrag() {
 function applySettingsClasses() {
   els.body.classList.toggle('mirrored', state.settings.mirrorUi);
   els.body.classList.toggle('topbar-hidden', !state.settings.topbarVisible);
+  els.body.classList.toggle('displayers-hidden', !state.settings.displayersEnabled);
   els.body.classList.toggle('dual-displayers', state.settings.dualDisplayers);
   els.body.classList.toggle('anchors-visible', anchorColumnVisible());
+  els.btnDisplayers.classList.toggle('active', !state.settings.displayersEnabled);
   els.btnDual.classList.toggle('active', state.settings.dualDisplayers);
+  els.btnDual.disabled = !state.settings.displayersEnabled;
   els.btnMirror.classList.toggle('active', state.settings.mirrorUi);
   els.btnTopbar.classList.toggle('active', !state.settings.topbarVisible);
   els.btnSettings.classList.toggle('active', state.settingsOpen);
   els.settingsPanel.classList.toggle('open', state.settingsOpen);
   els.settingsPanel.setAttribute('aria-hidden', state.settingsOpen ? 'false' : 'true');
+  els.settingDisplayersEnabled.checked = state.settings.displayersEnabled;
   els.settingDualDisplayers.checked = state.settings.dualDisplayers;
+  els.settingDualDisplayers.disabled = !state.settings.displayersEnabled;
   els.settingMirrorUi.checked = state.settings.mirrorUi;
   els.settingHideTopbarStartup.checked = state.settings.hideTopbarOnStartup;
   els.settingRememberWindowPosition.checked = state.settings.rememberWindowPosition;
   els.settingExpandBorderlessEdges.checked = state.settings.expandBorderlessEdges;
   els.settingAttentionAnchors.checked = state.settings.attentionAnchorsEnabled;
+  applyHistoryColumnsControl();
   applyPreviewFillSettings();
 }
 
@@ -769,8 +814,24 @@ function showItemInClipboardDisplayers(item) {
   });
 }
 
+// The grid is a fixed rows*columns layout (no scrolling), so rows have to be derived from
+// the chosen column count and however many slots are actually available right now (fewer
+// when the anchor column is showing) so every visible item always has a cell.
+function applyHistoryGridColumns() {
+  els.historyGrid.style.setProperty('--history-cols', effectiveHistoryColumns());
+  els.historyGrid.style.setProperty('--history-rows', HISTORY_ROWS);
+}
+
+function applyHistoryColumnsControl() {
+  if (!els.historyColumnsControl) return;
+  els.historyColumnsControl.querySelectorAll('[data-columns]').forEach(button => {
+    button.classList.toggle('active', Number(button.dataset.columns) === state.settings.historyColumns);
+  });
+}
+
 function renderHistory() {
   els.body.classList.toggle('anchors-visible', anchorColumnVisible());
+  applyHistoryGridColumns();
   const visibleItems = visibleHistoryItems();
   els.body.classList.toggle('has-history', visibleItems.length > 0);
   const existingNodes = new Map(
@@ -1694,6 +1755,20 @@ async function toggleDualDisplayers() {
   await saveSettings();
 }
 
+// Hides the whole displayers column (both displayers) rather than just going from two down to
+// one. Kept separate from dualDisplayers so re-enabling restores whatever 1-vs-2 state it had.
+async function setDisplayersEnabled(enabled) {
+  state.settings.displayersEnabled = enabled;
+  applySettingsClasses();
+  await saveSettings();
+  // Only relaxes/restores the native minimum width; never resizes the window itself.
+  await window.clipboardAPI.setDisplayersEnabledWindowConstraint(enabled).catch(() => {});
+}
+
+async function toggleDisplayersEnabled() {
+  await setDisplayersEnabled(!state.settings.displayersEnabled);
+}
+
 async function drainClipboardQueue() {
   if (state.drainInFlight) return;
   state.drainInFlight = true;
@@ -1741,6 +1816,7 @@ function bindChrome() {
   els.hiddenDragStrip.addEventListener('mousedown', event => {
     if (event.button === 0) saveWindowSoonAfterDrag();
   });
+  els.btnDisplayers.addEventListener('click', toggleDisplayersEnabled);
   els.btnDual.addEventListener('click', toggleDualDisplayers);
   els.btnMirror.addEventListener('click', async () => {
     state.settings.mirrorUi = !state.settings.mirrorUi;
@@ -1784,6 +1860,9 @@ function bindChrome() {
     const tile = event.target.closest('.anchor-item');
     openAnchorManager(tile?.dataset.anchorId || null);
   });
+  els.settingDisplayersEnabled.addEventListener('change', async () => {
+    await setDisplayersEnabled(els.settingDisplayersEnabled.checked);
+  });
   els.settingDualDisplayers.addEventListener('change', async () => {
     state.settings.dualDisplayers = els.settingDualDisplayers.checked;
     if (!state.settings.dualDisplayers) state.settings.activeDisplayer = 0;
@@ -1807,6 +1886,16 @@ function bindChrome() {
     applyPreviewFillSettings();
     await saveSettings();
     showToast(state.settings.portraitTopBias ? 'Portraits focus on top (faces)' : 'Portraits centered');
+  });
+  els.historyColumnsControl.addEventListener('click', async event => {
+    const button = event.target.closest('[data-columns]');
+    if (!button) return;
+    const columns = clamp(Number(button.dataset.columns), HISTORY_COLUMNS_MIN, HISTORY_COLUMNS_MAX);
+    if (columns === state.settings.historyColumns) return;
+    state.settings.historyColumns = columns;
+    applyHistoryColumnsControl();
+    renderHistory();
+    await saveSettings();
   });
   els.previewBiasControl.addEventListener('pointerdown', event => {
     const button = event.target.closest('[data-bias-direction]');

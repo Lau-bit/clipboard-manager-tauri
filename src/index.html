@@ -15,6 +15,7 @@
   <div id="titlebar">
     <div id="title-drag" title="Drag window"></div>
     <div id="toolbar">
+      <button id="btn-displayers" class="icon-button" title="Toggle image displayers">▌</button>
       <button id="btn-dual" class="icon-button" title="Toggle two displayers">2</button>
       <button id="btn-mirror" class="icon-button" title="Mirror UI">⇄</button>
       <button id="btn-topbar" class="icon-button" title="Hide top bar (Shift+Q)">▔</button>
@@ -31,6 +32,10 @@
       <button id="btn-settings-close" title="Close settings">×</button>
     </div>
     <label class="settings-row">
+      <input id="setting-displayers-enabled" type="checkbox">
+      <span>Show image displayers</span>
+    </label>
+    <label class="settings-row">
       <input id="setting-dual-displayers" type="checkbox">
       <span>Two image displayers</span>
     </label>
@@ -38,6 +43,16 @@
       <input id="setting-mirror-ui" type="checkbox">
       <span>Mirror UI</span>
     </label>
+    <div class="settings-row history-columns-row">
+      <span>History columns</span>
+      <div id="history-columns-control" class="history-columns">
+        <button type="button" data-columns="1" title="1 column">1</button>
+        <button type="button" data-columns="2" title="2 columns">2</button>
+        <button type="button" data-columns="3" title="3 columns">3</button>
+        <button type="button" data-columns="4" title="4 columns">4</button>
+        <button type="button" data-columns="5" title="5 columns">5</button>
+      </div>
+    </div>
     <label class="settings-row">
       <input id="setting-thumbnail-fill" type="checkbox">
       <span>Zoom small previews to fill cell</span>

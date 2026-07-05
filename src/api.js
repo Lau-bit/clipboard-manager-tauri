@@ -32,6 +32,7 @@ window.clipboardAPI = {
   saveSettings: settings => invoke('save_settings', { settings }),
   saveWindowState: () => invoke('save_window_state'),
   adjustWindowBorderlessEdges: expand => invoke('adjust_window_borderless_edges', { expand }),
+  setDisplayersEnabledWindowConstraint: enabled => invoke('set_displayers_enabled_window_constraint', { enabled }),
   drainClipboardItems: () => invoke('drain_clipboard_items'),
   onClipboardItemsReady: handler => {
     const listen = bridge()?.event?.listen;

@@ -89,6 +89,11 @@ button {
   background: rgba(255, 255, 255, 0.09);
 }
 
+.icon-button:disabled {
+  opacity: 0.35;
+  pointer-events: none;
+}
+
 #btn-dual.active,
 #btn-mirror.active {
   color: #071312;
@@ -165,6 +170,10 @@ button {
   background: rgba(255, 255, 255, 0.055);
 }
 
+.settings-row:has(input:disabled) {
+  opacity: 0.45;
+}
+
 .settings-row input {
   width: 14px;
   height: 14px;
@@ -187,6 +196,38 @@ button {
 .settings-action:hover {
   background: rgba(255, 255, 255, 0.085);
   color: #ffffff;
+}
+
+.history-columns-row {
+  justify-content: space-between;
+}
+
+.history-columns {
+  display: flex;
+  gap: 4px;
+}
+
+.history-columns button {
+  width: 20px;
+  height: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.045);
+  color: #d7d7d7;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.history-columns button:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #ffffff;
+}
+
+.history-columns button.active {
+  border-color: rgba(46, 215, 210, 0.72);
+  color: var(--accent);
+  background: rgba(46, 215, 210, 0.12);
 }
 
 .preview-bias-row {
@@ -279,13 +320,16 @@ body.topbar-hidden #workspace {
 
 body.topbar-hidden .mode-chip,
 body.topbar-hidden .displayer-tools,
-body.topbar-hidden #btn-clear,
 body.topbar-hidden #btn-clear-anchors {
   display: none;
 }
 
 body.mirrored #workspace {
   flex-direction: row-reverse;
+}
+
+body.displayers-hidden #displayers {
+  display: none;
 }
 
 #displayers {
@@ -452,8 +496,15 @@ body.mirrored #displayers {
   position: absolute;
   inset: 0;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  grid-template-rows: repeat(6, minmax(0, 1fr));
+  /* --history-cols is set from JS (applyHistoryGridColumns) from the chosen column count;
+     rows are always a fixed 6. The literal fallbacks only apply before that first runs. */
+  grid-template-columns: repeat(var(--history-cols, 3), minmax(0, 1fr));
+  grid-template-rows: repeat(var(--history-rows, 6), minmax(0, 1fr));
+  /* Column-major: each column fills top-to-bottom before the next one starts, so the
+     leftmost column is always the most recent 6 items, the next column the 6 before
+     that, and so on. Safe now that rows are pinned at a fixed 6 (see above) — a column
+     can never hold more than 6 items, so it's forced to spill into the next column
+     rather than absorbing everything itself. */
   grid-auto-flow: column;
   gap: var(--history-gap);
   overflow: hidden;
@@ -461,7 +512,6 @@ body.mirrored #displayers {
 
 body.anchors-visible #history-grid {
   left: 33.3333%;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
   border-left: 1px solid rgba(46, 215, 210, 0.18);
 }
 
@@ -1210,11 +1260,6 @@ body.anchor-dragging {
 @media (max-width: 760px) {
   :root {
     --displayers-w: 34%;
-  }
-
-  #history-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    grid-template-rows: repeat(6, minmax(0, 1fr));
   }
 
   #settings-panel {
