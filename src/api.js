@@ -60,6 +60,7 @@ window.clipboardAPI = {
     naturalH: naturalHeight,
   }),
   getAssignedImagePath: () => invoke('get_assigned_image_path'),
+  openTextInEditor: text => invoke('open_text_in_editor', { text }),
   pickImage: async () => {
     const dialog = bridge()?.dialog;
     if (!dialog) throw new Error('Dialog API not ready');

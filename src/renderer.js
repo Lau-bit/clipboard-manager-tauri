@@ -956,6 +956,7 @@ function createHistoryNode(item) {
   node.dataset.itemId = item.id;
   node.addEventListener('click', () => selectItem(item));
   node.addEventListener('dblclick', event => openItemInViewer(item, event));
+  node.addEventListener('contextmenu', event => openHistoryItemMenu(event, item));
 
   if (item.kind === 'image') {
     const image = document.createElement('img');
@@ -1028,15 +1029,23 @@ async function copyAndRaise(item) {
 
 // Double-click: images open in their own floating viewer window; text still copies.
 async function openItemInViewer(item, event) {
-  if (item.kind !== 'image' || !item.filePath) {
-    await copyAndRaise(item);
+  if (item.kind === 'image' && item.filePath) {
+    try {
+      await window.clipboardAPI.openImageWindow(item.filePath, event.clientX, event.clientY, item.width || 0, item.height || 0);
+    } catch (error) {
+      console.error(error);
+      showToast('Could not open image window');
+    }
     return;
   }
+  // Text item: open its contents in the system's default text editor in a new window.
+  const text = item.text || '';
+  if (!text) return;
   try {
-    await window.clipboardAPI.openImageWindow(item.filePath, event.clientX, event.clientY, item.width || 0, item.height || 0);
+    await window.clipboardAPI.openTextInEditor(text);
   } catch (error) {
     console.error(error);
-    showToast('Could not open image window');
+    showToast('Could not open text editor');
   }
 }
 
@@ -1093,6 +1102,28 @@ function openDisplayerMenu(event, index) {
     menuButton('Clear displayer', false, () => clearDisplayer(index), settings.mode === 'defaultImage'),
   ];
 
+  showContextMenu(buttons, event);
+}
+
+// Right-click menu for a clipboard history item. Selecting first (so the item is the
+// current selection) means the menu's actions and any follow-up keyboard shortcut both
+// operate on the item the user actually clicked.
+function openHistoryItemMenu(event, item) {
+  event.preventDefault();
+  event.stopPropagation();
+  selectItem(item);
+  const buttons = [menuButton('Copy', false, () => copyAndRaise(item), !!item.bundled)];
+  if (item.kind === 'text') {
+    buttons.push(menuButton('Open in text editor', false, () => openItemInViewer(item, event)));
+  } else if (item.kind === 'image' && item.filePath) {
+    buttons.push(menuButton('Open image', false, () => openItemInViewer(item, event)));
+  }
+  showContextMenu(buttons, event);
+}
+
+// Populate, open, and position the shared context menu at the event's cursor, clamped to
+// the window.
+function showContextMenu(buttons, event) {
   els.contextMenu.replaceChildren(...buttons);
   els.contextMenu.classList.add('open');
   const menuRect = els.contextMenu.getBoundingClientRect();

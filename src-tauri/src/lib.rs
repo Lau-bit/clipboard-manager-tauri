@@ -1643,6 +1643,65 @@ fn get_assigned_image_path(window: WebviewWindow, state: tauri::State<AppState>)
     state.image_paths.lock().ok()?.get(window.label()).cloned()
 }
 
+/// Write a text clipboard item out to a temp `.txt` file and open it in the system's
+/// default text editor (the default handler for `.txt`) in its own new window.
+#[tauri::command]
+fn open_text_in_editor(text: String) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("No text to open.".to_string());
+    }
+    // Name the file by a hash of its content so re-opening the same item reuses one temp file
+    // instead of accumulating a new one on every double-click.
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    let hash = hasher.finish();
+    let dir = std::env::temp_dir().join("clipboard-manager-text");
+    fs::create_dir_all(&dir).map_err(|error| format!("Failed to create temp dir: {error}"))?;
+    let path = dir.join(format!("clip-{hash:016x}.txt"));
+    fs::write(&path, text.as_bytes())
+        .map_err(|error| format!("Failed to write temp file: {error}"))?;
+    open_path_in_default_app(&path)
+}
+
+/// Open a filesystem path with the OS's default handler (for a `.txt` file, that's the
+/// user's default text editor), in its own window/process.
+#[cfg(windows)]
+fn open_path_in_default_app(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let file: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // ShellExecuteW returns an HINSTANCE-shaped handle; any value <= 32 signals failure.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (result as isize) <= 32 {
+        return Err(format!(
+            "Failed to open default editor (code {})",
+            result as isize
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_path_in_default_app(_path: &Path) -> Result<(), String> {
+    Err("Opening the default text editor is only supported on Windows.".to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1707,6 +1766,7 @@ pub fn run() {
             load_hidden_history,
             load_settings,
             open_image_window,
+            open_text_in_editor,
             paste_default_image,
             remove_default_image,
             save_image_as_default,
