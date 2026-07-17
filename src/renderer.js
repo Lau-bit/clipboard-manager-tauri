@@ -32,6 +32,12 @@ const PREVIEW_BIAS_REPEAT_MS = 1000 / 30;
 // than their cell get their cover crop panned up toward the top, where faces usually sit.
 const PORTRAIT_MIN_ASPECT = 1.02;
 const PORTRAIT_FACE_SAFE_PAN = 0.78;
+// Size a clicked-open floating image window opens at: 0 = "Default" (fit a comfortable share of
+// the monitor), 25..100 = that percent of the image's true size, where 100 is "True size". The
+// slider steps in 25s; the Rust side (open_image_window) does the actual sizing math.
+const OPENED_IMAGE_SIZE_DEFAULT = 0;
+const OPENED_IMAGE_SIZE_MIN_PERCENT = 25;
+const OPENED_IMAGE_SIZE_MAX_PERCENT = 100;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -61,6 +67,8 @@ const els = {
   settingThumbnailFill: document.getElementById('setting-thumbnail-fill'),
   settingPortraitTopBias: document.getElementById('setting-portrait-top-bias'),
   historyColumnsControl: document.getElementById('history-columns-control'),
+  settingOpenedImageSize: document.getElementById('setting-opened-image-size'),
+  openedImageSizeValue: document.getElementById('opened-image-size-value'),
   previewBiasControl: document.getElementById('preview-bias-control'),
   previewBiasLetter: document.getElementById('preview-bias-letter'),
   previewBiasValue: document.getElementById('preview-bias-value'),
@@ -152,6 +160,7 @@ function defaultSettings() {
     portraitTopBias: true,
     historyColumns: HISTORY_COLUMNS_DEFAULT,
     displayersEnabled: true,
+    openedImageSize: OPENED_IMAGE_SIZE_DEFAULT,
     dualDisplayers: false,
     activeDisplayer: 0,
     maxHistory: HISTORY_LIMIT,
@@ -212,7 +221,20 @@ function normalizeSettings(settings) {
     HISTORY_COLUMNS_MAX
   );
   next.displayersEnabled = next.displayersEnabled !== false;
+  next.openedImageSize = normalizeOpenedImageSize(next.openedImageSize);
   return next;
+}
+
+function normalizeOpenedImageSize(value) {
+  const n = Math.round(Number(value) || 0);
+  if (n <= 0) return OPENED_IMAGE_SIZE_DEFAULT;
+  return clamp(n, OPENED_IMAGE_SIZE_MIN_PERCENT, OPENED_IMAGE_SIZE_MAX_PERCENT);
+}
+
+function openedImageSizeLabelText(value) {
+  if (!value) return 'Default';
+  if (value >= OPENED_IMAGE_SIZE_MAX_PERCENT) return 'True size';
+  return `${value}%`;
 }
 
 function normalizeAnchors(anchors) {
@@ -430,7 +452,17 @@ function applySettingsClasses() {
   els.settingExpandBorderlessEdges.checked = state.settings.expandBorderlessEdges;
   els.settingAttentionAnchors.checked = state.settings.attentionAnchorsEnabled;
   applyHistoryColumnsControl();
+  applyOpenedImageSizeControl();
   applyPreviewFillSettings();
+}
+
+function applyOpenedImageSizeControl() {
+  if (!els.settingOpenedImageSize) return;
+  const value = state.settings.openedImageSize || OPENED_IMAGE_SIZE_DEFAULT;
+  els.settingOpenedImageSize.value = String(value);
+  if (els.openedImageSizeValue) {
+    els.openedImageSizeValue.textContent = openedImageSizeLabelText(value);
+  }
 }
 
 function applyPreviewFillSettings() {
@@ -1928,6 +1960,22 @@ function bindChrome() {
     renderHistory();
     await saveSettings();
   });
+  if (els.settingOpenedImageSize) {
+    // Live-update the label as the slider is dragged; persist only on release/commit.
+    els.settingOpenedImageSize.addEventListener('input', () => {
+      const value = normalizeOpenedImageSize(els.settingOpenedImageSize.value);
+      state.settings.openedImageSize = value;
+      if (els.openedImageSizeValue) {
+        els.openedImageSizeValue.textContent = openedImageSizeLabelText(value);
+      }
+    });
+    els.settingOpenedImageSize.addEventListener('change', async () => {
+      state.settings.openedImageSize = normalizeOpenedImageSize(els.settingOpenedImageSize.value);
+      applyOpenedImageSizeControl();
+      await saveSettings();
+      showToast(`Images open at ${openedImageSizeLabelText(state.settings.openedImageSize).toLowerCase()}`);
+    });
+  }
   els.previewBiasControl.addEventListener('pointerdown', event => {
     const button = event.target.closest('[data-bias-direction]');
     if (button && !button.disabled) {

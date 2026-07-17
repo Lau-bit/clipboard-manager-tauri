@@ -189,6 +189,17 @@ fn default_true() -> bool {
     true
 }
 
+// How large a floating image window opens. `0` is the sentinel "Default" fit mode; any other
+// value is a percent of the image's true (native) size, where `100` == "True size". Kept in
+// [OPENED_IMAGE_SIZE_MIN_PERCENT, OPENED_IMAGE_SIZE_MAX_PERCENT] when not the sentinel.
+const OPENED_IMAGE_SIZE_DEFAULT: i32 = 0;
+const OPENED_IMAGE_SIZE_MIN_PERCENT: i32 = 25;
+const OPENED_IMAGE_SIZE_MAX_PERCENT: i32 = 100;
+
+fn default_opened_image_size() -> i32 {
+    OPENED_IMAGE_SIZE_DEFAULT
+}
+
 fn default_history_columns() -> u32 {
     HISTORY_COLUMNS_DEFAULT
 }
@@ -227,6 +238,11 @@ struct Settings {
     // width the displayers column would otherwise require (see `apply_window_min_size`).
     #[serde(default = "default_true")]
     displayers_enabled: bool,
+    // How big a clicked-open floating image window is: 0 = "Default" (fit a comfortable share
+    // of the monitor, never upscaled past native); 25..=100 = that percent of the image's true
+    // size, where 100 is "True size" (native pixels). Always clamped to fit the monitor.
+    #[serde(default = "default_opened_image_size")]
+    opened_image_size: i32,
     dual_displayers: bool,
     active_displayer: usize,
     max_history: usize,
@@ -256,6 +272,7 @@ impl Default for Settings {
             portrait_top_bias: true,
             history_columns: HISTORY_COLUMNS_DEFAULT,
             displayers_enabled: true,
+            opened_image_size: OPENED_IMAGE_SIZE_DEFAULT,
             dual_displayers: false,
             active_displayer: 0,
             max_history: HISTORY_LIMIT,
@@ -396,6 +413,11 @@ fn normalize_settings(mut settings: Settings) -> Settings {
     settings.history_columns = settings
         .history_columns
         .clamp(HISTORY_COLUMNS_MIN, HISTORY_COLUMNS_MAX);
+    if settings.opened_image_size != OPENED_IMAGE_SIZE_DEFAULT {
+        settings.opened_image_size = settings
+            .opened_image_size
+            .clamp(OPENED_IMAGE_SIZE_MIN_PERCENT, OPENED_IMAGE_SIZE_MAX_PERCENT);
+    }
 
     if !matches!(
         settings.thumbnail_fill_bias_direction.as_str(),
@@ -1533,13 +1555,8 @@ async fn open_image_window(
     let owner_position = window
         .outer_position()
         .map_err(|error| format!("Failed to read window position: {error}"))?;
-    let owner_size = window
-        .inner_size()
-        .map_err(|error| format!("Failed to read window size: {error}"))?;
     let owner_x = f64::from(owner_position.x) / scale;
     let owner_y = f64::from(owner_position.y) / scale;
-    let owner_w = f64::from(owner_size.width) / scale;
-    let owner_h = f64::from(owner_size.height) / scale;
     let cursor_screen_x = owner_x + cursor_x;
     let cursor_screen_y = owner_y + cursor_y;
 
@@ -1556,16 +1573,33 @@ async fn open_image_window(
     const MIN_WIDTH: f64 = 200.0;
     const MIN_HEIGHT: f64 = 150.0;
     const CURSOR_GAP: f64 = 12.0;
+    // "Default" mode fits the image into this comfortable share of the monitor (never upscaling
+    // past native) — previously it was capped to the small clipboard window, which made images
+    // open tiny.
+    const DEFAULT_MONITOR_FRACTION: f64 = 0.72;
+    // Keep a little clearance around any opened window so it never sits flush to the monitor
+    // edges, even at "True size".
+    const SCREEN_MARGIN: f64 = 96.0;
 
-    // Never exceed the main clipboard window's size; also stay within the monitor. This makes
-    // images open smaller whenever the clipboard window is smaller.
-    let max_w = owner_w.min(monitor_w);
-    let max_h = owner_h.min(monitor_h);
-    let fit_scale = (max_w / natural_w.max(1.0))
-        .min(max_h / natural_h.max(1.0))
-        .min(1.0);
-    let width = (natural_w * fit_scale).max(MIN_WIDTH.min(max_w));
-    let height = (natural_h * fit_scale).max(MIN_HEIGHT.min(max_h));
+    let opened_image_size = load_settings_inner(&app).opened_image_size;
+    let avail_w = (monitor_w - SCREEN_MARGIN).max(MIN_WIDTH);
+    let avail_h = (monitor_h - SCREEN_MARGIN).max(MIN_HEIGHT);
+    let nat_w = natural_w.max(1.0);
+    let nat_h = natural_h.max(1.0);
+
+    let size_scale = if opened_image_size == OPENED_IMAGE_SIZE_DEFAULT {
+        // Fit within a large share of the monitor; never upscale past the image's true size.
+        (avail_w * DEFAULT_MONITOR_FRACTION / nat_w)
+            .min(avail_h * DEFAULT_MONITOR_FRACTION / nat_h)
+            .min(1.0)
+    } else {
+        // Open at the chosen percent of true size, shrunk only as far as needed to fit the monitor.
+        let desired = f64::from(opened_image_size) / 100.0;
+        desired.min(avail_w / nat_w).min(avail_h / nat_h)
+    };
+
+    let width = (nat_w * size_scale).max(MIN_WIDTH.min(avail_w));
+    let height = (nat_h * size_scale).max(MIN_HEIGHT.min(avail_h));
 
     // Place the left edge slightly left of the cursor so the pointer lands just inside the
     // window's draggable edge band — ready to drag immediately. Vertically centered; clamped

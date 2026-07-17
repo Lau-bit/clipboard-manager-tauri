@@ -43,6 +43,21 @@
       <input id="setting-mirror-ui" type="checkbox">
       <span>Mirror UI</span>
     </label>
+    <div class="settings-row opened-image-size-row">
+      <span>Opened image size</span>
+      <div class="opened-image-size">
+        <input id="setting-opened-image-size" type="range" min="0" max="100" step="25"
+               list="opened-image-size-ticks" title="Size images open at when clicked open">
+        <datalist id="opened-image-size-ticks">
+          <option value="0"></option>
+          <option value="25"></option>
+          <option value="50"></option>
+          <option value="75"></option>
+          <option value="100"></option>
+        </datalist>
+        <span id="opened-image-size-value">Default</span>
+      </div>
+    </div>
     <div class="settings-row history-columns-row">
       <span>History columns</span>
       <div id="history-columns-control" class="history-columns">

@@ -198,6 +198,34 @@ button {
   color: #ffffff;
 }
 
+.opened-image-size-row {
+  justify-content: space-between;
+}
+
+.opened-image-size {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Override the checkbox-sized `.settings-row input` rule for the range slider. */
+.opened-image-size input[type="range"] {
+  width: 108px;
+  height: 16px;
+  margin: 0;
+  padding: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+#opened-image-size-value {
+  min-width: 58px;
+  text-align: right;
+  font-size: 11px;
+  color: #bcbcbc;
+  font-variant-numeric: tabular-nums;
+}
+
 .history-columns-row {
   justify-content: space-between;
 }
