@@ -5,6 +5,10 @@ const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 12;
 const BUNDLED_DEFAULT_IMAGE = 'pyramid-source.png';
 const CLIPBOARD_FALLBACK_POLL_MS = 5000;
+// If a drain has been "in flight" longer than this, its await was almost certainly frozen by a
+// WebView2 suspend / sleep-wake and will never settle; the guard is treated as stale so a new
+// drain can proceed. Must comfortably exceed any real drain (a single fast IPC round-trip).
+const DRAIN_STUCK_MS = 8000;
 // Number of distinct abstract-shape styles to cycle tiles through. Anchors themselves
 // are unlimited; this only controls the visual variety of the generated shapes.
 const ANCHOR_SHAPE_VARIANTS = 6;
@@ -112,6 +116,7 @@ const state = {
   pollTimer: null,
   clipboardUnlisten: null,
   drainInFlight: false,
+  drainStartedAt: 0,
   saveWindowTimer: null,
   anchorSaveTimer: null,
   hiddenHistorySaveTimer: null,
@@ -1833,8 +1838,16 @@ async function toggleDisplayersEnabled() {
 }
 
 async function drainClipboardQueue() {
-  if (state.drainInFlight) return;
+  if (state.drainInFlight) {
+    // A drain's `await` can be frozen by a WebView2 suspend / sleep-wake and never settle,
+    // which would wedge this flag true forever and silently stop every future drain (captures
+    // then pile up unseen in the backend's pending queue). If we've been "in flight" far
+    // longer than any real drain could take, treat the old one as dead and fall through so
+    // draining can resume on its own.
+    if (Date.now() - state.drainStartedAt < DRAIN_STUCK_MS) return;
+  }
   state.drainInFlight = true;
+  state.drainStartedAt = Date.now();
   try {
     const items = await window.clipboardAPI.drainClipboardItems();
     for (const item of items) addHistoryItem(item);
@@ -1853,15 +1866,37 @@ function scheduleClipboardFallbackDrain() {
   }, CLIPBOARD_FALLBACK_POLL_MS);
 }
 
+// Long-session / sleep-wake recovery. WebView2 throttles or fully suspends JS for a window
+// that is occluded or asleep, and the clipboard-items-ready event bridge can go quiet across
+// a suspend. Whenever the window becomes active again (visible or focused — i.e. exactly when
+// the user looks at it after a resume), clear any wedged in-flight flag and immediately drain
+// everything the backend captured while we were out, rather than waiting for the backstop
+// poll. Resetting the flag is safe: the backend drains its pending queue atomically, so a
+// genuinely concurrent drain just gets an empty list, and addHistoryItem dedupes by
+// fingerprint anyway.
+function recoverClipboardDrain() {
+  state.drainInFlight = false;
+  drainClipboardQueue();
+}
+
 async function startClipboardDrain() {
   await drainClipboardQueue();
   try {
     state.clipboardUnlisten = await window.clipboardAPI.onClipboardItemsReady(drainClipboardQueue);
   } catch {
-    // Event wiring is unavailable — fall back to slow polling so the app still works.
-    // In the normal case the backend pushes an event on every capture, so no idle timer runs.
-    scheduleClipboardFallbackDrain();
+    // Event wiring is unavailable — the backstop poll below still keeps the app working.
   }
+  // The clipboard-items-ready event is the fast path, but it can go quiet across a WebView2
+  // suspend / sleep-wake. Run a low-frequency backstop poll ALWAYS (not only when event wiring
+  // fails): it drains the in-memory pending queue (no clipboard access, so far cheaper than the
+  // old clipboard poll and silent when nothing is pending), catching anything the event bridge
+  // missed — including the second-monitor case where the window never loses or regains focus,
+  // so the visibility/focus recovery below never fires.
+  scheduleClipboardFallbackDrain();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') recoverClipboardDrain();
+  });
+  window.addEventListener('focus', recoverClipboardDrain);
 }
 
 function setSettingsOpen(open) {
