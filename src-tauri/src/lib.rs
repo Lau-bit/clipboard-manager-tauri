@@ -11,9 +11,9 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
-        Mutex,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -24,9 +24,13 @@ use tauri::{
 };
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 #[cfg(windows)]
-use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DwmSetWindowAttribute};
+#[cfg(windows)]
+use windows_sys::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, GetClipboardSequenceNumber,
@@ -36,8 +40,8 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
-    PostQuitMessage, RegisterClassW, SetWindowLongPtrW, TranslateMessage, GWLP_USERDATA,
-    HWND_MESSAGE, MSG, WM_CLIPBOARDUPDATE, WM_DESTROY, WNDCLASSW,
+    GetWindowRect, IsIconic, IsZoomed, PostQuitMessage, RegisterClassW, SetWindowLongPtrW,
+    TranslateMessage, GWLP_USERDATA, HWND_MESSAGE, MSG, WM_CLIPBOARDUPDATE, WM_DESTROY, WNDCLASSW,
 };
 
 const HISTORY_CACHE_DIR: &str = "clipboard-history";
@@ -86,6 +90,20 @@ const CLIPBOARD_READ_RETRY_DELAY: Duration = Duration::from_millis(20);
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 #[cfg(windows)]
 const DWMWCP_DONOTROUND: u32 = 1;
+#[cfg(windows)]
+const DWMWCP_ROUND: u32 = 2;
+// The window's visible frame, excluding the invisible resize border WS_THICKFRAME adds
+// (~7px on this app's windows) that GetWindowRect counts as part of the window.
+#[cfg(windows)]
+const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
+// Physical-pixel slack for calling a window edge "flush" with the monitor work area.
+#[cfg(windows)]
+const SNAP_EDGE_TOLERANCE: i32 = 4;
+// A snapped window always covers at least about half of the work area along one axis: halves
+// and thirds span its full height, quarters span half of both. Requiring that alongside flush
+// edges keeps a small floating image nudged into a screen corner from reading as snapped.
+#[cfg(windows)]
+const SNAP_SPAN_PERCENT: i32 = 45;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1124,11 +1142,10 @@ fn apply_window_min_size(window: &WebviewWindow, displayers_enabled: bool) -> Re
 }
 
 #[cfg(windows)]
-fn square_window_corners(window: &WebviewWindow) {
+fn set_window_corner_preference(window: &WebviewWindow, preference: u32) {
     let Ok(hwnd) = window.hwnd() else {
         return;
     };
-    let preference = DWMWCP_DONOTROUND;
     unsafe {
         let _ = DwmSetWindowAttribute(
             hwnd.0 as _,
@@ -1139,8 +1156,102 @@ fn square_window_corners(window: &WebviewWindow) {
     }
 }
 
+#[cfg(windows)]
+fn square_window_corners(window: &WebviewWindow) {
+    set_window_corner_preference(window, DWMWCP_DONOTROUND);
+}
+
 #[cfg(not(windows))]
 fn square_window_corners(_window: &WebviewWindow) {}
+
+/// True when the window is filling a region of the screen rather than floating freely —
+/// maximized, or snapped by drag-to-edge / Win+Arrow / Snap Layouts.
+///
+/// This is measured geometrically, against the monitor's work area, because Windows exposes no
+/// "is snapped" flag. The tempting proxy — a `WINDOWPLACEMENT.rcNormalPosition` that still
+/// holds the pre-snap size — does not work: measured on this machine, snapping updates the
+/// restore rect to match the snapped rect, so it never diverges. What every snap layout does
+/// share is that the window sits flush against the work-area edges on two or more sides while
+/// covering a large share of it, and that is what is tested here.
+#[cfg(windows)]
+fn is_window_snapped(hwnd: HWND) -> bool {
+    unsafe {
+        if IsZoomed(hwnd) != 0 {
+            return true;
+        }
+        let mut frame: RECT = std::mem::zeroed();
+        let has_frame_bounds = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&mut frame as *mut RECT).cast(),
+            std::mem::size_of::<RECT>() as u32,
+        ) == 0;
+        if !has_frame_bounds && GetWindowRect(hwnd, &mut frame) == 0 {
+            return false;
+        }
+
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return false;
+        }
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return false;
+        }
+        let work = info.rcWork;
+
+        let flush_edges = [
+            frame.left - work.left,
+            frame.top - work.top,
+            frame.right - work.right,
+            frame.bottom - work.bottom,
+        ]
+        .iter()
+        .filter(|delta| delta.abs() <= SNAP_EDGE_TOLERANCE)
+        .count();
+        if flush_edges < 2 {
+            return false;
+        }
+
+        let spans_width =
+            (frame.right - frame.left) * 100 >= (work.right - work.left) * SNAP_SPAN_PERCENT;
+        let spans_height =
+            (frame.bottom - frame.top) * 100 >= (work.bottom - work.top) * SNAP_SPAN_PERCENT;
+        spans_width || spans_height
+    }
+}
+
+/// Floating image windows get Windows 11 rounded corners while they float free, and square
+/// corners the moment they are snapped — so snapped images tile flush against each other and
+/// the screen edges instead of leaving rounded notches.
+///
+/// `last_preference` caches what was last handed to DWM (0 = nothing yet) so the per-pixel
+/// `Moved` events of a window drag don't turn into a stream of redundant DWM calls.
+#[cfg(windows)]
+fn apply_floating_image_corners(window: &WebviewWindow, last_preference: &AtomicU32) {
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let hwnd = hwnd.0 as HWND;
+    // A minimized window reports a placeholder rect that would read as snapped; leave the
+    // current preference alone and re-evaluate when it is restored.
+    if unsafe { IsIconic(hwnd) } != 0 {
+        return;
+    }
+    let preference = if is_window_snapped(hwnd) {
+        DWMWCP_DONOTROUND
+    } else {
+        DWMWCP_ROUND
+    };
+    if last_preference.swap(preference, Ordering::Relaxed) == preference {
+        return;
+    }
+    set_window_corner_preference(window, preference);
+}
+
+#[cfg(not(windows))]
+fn apply_floating_image_corners(_window: &WebviewWindow, _last_preference: &AtomicU32) {}
 
 fn expand_borderless_edges(bounds: &WindowState) -> WindowState {
     let expand = u32::try_from(BORDERLESS_EDGE_EXPAND).unwrap_or(0);
@@ -1642,7 +1753,8 @@ async fn open_image_window(
     .build()
     .map_err(|error| format!("Failed to build image window: {error}"))?;
 
-    square_window_corners(&image_window);
+    let corner_preference = Arc::new(AtomicU32::new(0));
+    apply_floating_image_corners(&image_window, &corner_preference);
     let _ = set_window_bounds(
         &image_window,
         &WindowState {
@@ -1658,8 +1770,15 @@ async fn open_image_window(
 
     let app_for_cleanup = app.clone();
     let label_for_cleanup = label.clone();
-    image_window.on_window_event(move |event| {
-        if matches!(event, WindowEvent::Destroyed) {
+    image_window.on_window_event(move |event| match event {
+        // Snapping the window changes its size and position, so re-decide rounded vs square
+        // corners on every geometry change.
+        WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+            if let Some(window) = app_for_cleanup.get_webview_window(&label_for_cleanup) {
+                apply_floating_image_corners(&window, &corner_preference);
+            }
+        }
+        WindowEvent::Destroyed => {
             if let Ok(mut paths) = app_for_cleanup.state::<AppState>().image_paths.lock() {
                 paths.remove(&label_for_cleanup);
             }
@@ -1667,6 +1786,7 @@ async fn open_image_window(
                 owners.remove(&label_for_cleanup);
             }
         }
+        _ => {}
     });
 
     Ok(())
