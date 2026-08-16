@@ -42,9 +42,34 @@ const PORTRAIT_FACE_SAFE_PAN = 0.78;
 const OPENED_IMAGE_SIZE_DEFAULT = 0;
 const OPENED_IMAGE_SIZE_MIN_PERCENT = 25;
 const OPENED_IMAGE_SIZE_MAX_PERCENT = 100;
+// A copied text item can be megabytes (a whole file, a build log). The item keeps all of it —
+// copying it back must be lossless — but the DOM only ever needs enough to fill a small grid
+// cell, a tooltip, or a displayer. Handing the full payload to any of those costs layout time
+// and memory for characters nobody can read: a 4 MB item measured ~165ms of layout per tile,
+// and `title` hands the whole string to the OS tooltip.
+const PREVIEW_TEXT_MAX = 2000;
+const TOOLTIP_TEXT_MAX = 400;
+const DISPLAYER_TEXT_MAX = 50000;
+// Anchor emoji are capped by CODE POINT, not by UTF-16 unit: slicing mid-surrogate leaves a
+// lone half that renders as a replacement glyph and gets persisted that way.
+const ANCHOR_EMOJI_MAX_CODE_POINTS = 8;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+// Shorten for display only — never for what gets copied back.
+function excerpt(text, limit) {
+  if (!text) return '';
+  return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+
+// Truncate by code point so an emoji is never cut in half. `String.prototype.slice` counts
+// UTF-16 units, so slicing 👨 (2 units) at an odd boundary yields a lone surrogate.
+function trimToCodePoints(value, max) {
+  if (typeof value !== 'string') return '';
+  const points = [...value];
+  return points.length > max ? points.slice(0, max).join('') : value;
 }
 
 const els = {
@@ -260,7 +285,7 @@ function normalizeAnchors(anchors) {
     return {
       id,
       active: typeof item.active === 'boolean' ? item.active : false,
-      emoji: typeof item.emoji === 'string' ? item.emoji.slice(0, 8) : '',
+      emoji: trimToCodePoints(item.emoji, ANCHOR_EMOJI_MAX_CODE_POINTS),
       title: typeof item.title === 'string' ? item.title : '',
       imagePath: typeof item.imagePath === 'string' && item.imagePath ? item.imagePath : null,
       shapePattern: normalizeShapePattern(item.shapePattern),
@@ -754,7 +779,9 @@ function drawItem(displayer, item, options = {}) {
   if (item.kind === 'text') {
     const text = document.createElement('div');
     text.className = 'display-text';
-    text.textContent = item.text || '';
+    // Zoomable, pannable text — but still only a preview. A multi-megabyte item is laid out
+    // in full otherwise, for characters far past anything readable at this size.
+    text.textContent = excerpt(item.text, DISPLAYER_TEXT_MAX);
     displayer.content.append(text);
     applyTransform(displayer);
     return;
@@ -765,6 +792,11 @@ function drawItem(displayer, item, options = {}) {
     image.className = 'display-image';
     image.classList.toggle('zoom-fill', shouldZoomImageToFill(displayer, item, options.source));
     image.draggable = false;
+    image.addEventListener('error', () => {
+      displayer.root.classList.add('missing-image');
+    });
+    image.addEventListener('load', () => displayer.root.classList.remove('missing-image'));
+    displayer.root.classList.remove('missing-image');
     image.src = item.bundled ? item.filePath : itemUrl(item);
     displayer.content.append(image);
     applyTransform(displayer);
@@ -829,16 +861,18 @@ function endPan(displayer) {
 function addHistoryItem(item) {
   if (!item?.fingerprint) return;
   if (state.history[0]?.fingerprint === item.fingerprint) return;
-  const shouldDisplayNewItem = !state.selectedId && !state.selectedItemSnapshot;
   state.history = state.history.filter(existing => existing.fingerprint !== item.fingerprint);
   state.history.unshift(item);
   state.history.length = Math.min(state.history.length, state.settings.maxHistory);
-  if (shouldDisplayNewItem) {
-    state.selectedAnchorId = null;
-    state.selectedId = item.id;
-    state.selectedItemSnapshot = item;
-    showItemInClipboardDisplayers(item);
-  }
+  // Showing a fresh copy is the whole job of a "Display clipboard items" displayer; a
+  // displayer that should hold still across new copies is what "Sticky current item" mode is
+  // for. This used to be skipped whenever anything was selected, and since the very first
+  // capture of a session set the selection itself, in practice the clipboard displayers
+  // stopped following the clipboard after one copy and only resumed after Escape.
+  state.selectedAnchorId = null;
+  state.selectedId = item.id;
+  state.selectedItemSnapshot = item;
+  showItemInClipboardDisplayers(item);
   renderAnchors();
   renderHistory();
 }
@@ -1002,12 +1036,19 @@ function createHistoryNode(item) {
     image.decoding = 'async';
     image.loading = 'lazy';
     // Natural size is unknown until load, so (re)apply the per-image bias once it's available.
-    image.addEventListener('load', () => applyThumbBias(image));
+    image.addEventListener('load', () => {
+      node.classList.remove('missing-image');
+      applyThumbBias(image);
+    });
+    // A cached image can go away underneath a still-listed item (the cache is wiped at
+    // startup and trimmed as it grows). Without this the tile just renders as an empty cell,
+    // which is indistinguishable from a blank image.
+    image.addEventListener('error', () => node.classList.add('missing-image'));
     node.append(image);
   } else {
     const text = document.createElement('div');
     text.className = 'history-text';
-    text.textContent = item.text || '';
+    text.textContent = excerpt(item.text, PREVIEW_TEXT_MAX);
     node.append(text);
   }
 
@@ -1016,7 +1057,9 @@ function createHistoryNode(item) {
 
 function updateHistoryNode(node, item) {
   node.classList.toggle('selected', item.id === state.selectedId);
-  node.title = item.kind === 'text' ? item.text || '' : `${item.width || '?'} x ${item.height || '?'}`;
+  node.title = item.kind === 'text'
+    ? excerpt(item.text, TOOLTIP_TEXT_MAX)
+    : `${item.width || '?'} x ${item.height || '?'}`;
   if (item.kind === 'image') {
     const image = node.querySelector('.history-thumb');
     if (image) {
@@ -1024,14 +1067,16 @@ function updateHistoryNode(node, item) {
       const src = itemThumbnailUrl(item);
       if (image.dataset.src !== src) {
         image.dataset.src = src;
+        node.classList.remove('missing-image');
         image.src = src;
       }
       applyThumbBias(image);
     }
   } else {
     const text = node.querySelector('.history-text');
-    if (text && text.textContent !== (item.text || '')) {
-      text.textContent = item.text || '';
+    const preview = excerpt(item.text, PREVIEW_TEXT_MAX);
+    if (text && text.textContent !== preview) {
+      text.textContent = preview;
     }
   }
 }
@@ -1090,16 +1135,39 @@ function deleteSelected() {
   const item = selectedItem();
   if (!item) return;
   state.history = state.history.filter(existing => existing.id !== item.id);
-  state.selectedId = state.history[0]?.id || null;
-  state.selectedItemSnapshot = state.history[0] || null;
+  const next = state.history[0] || null;
+  state.selectedId = next?.id || null;
+  state.selectedItemSnapshot = next;
+  // The deleted item may still be on show in a clipboard displayer. Move those onto whatever
+  // is selected now (or empty them), so the highlighted tile and the big preview can never
+  // disagree about which item is current.
+  if (next) showItemInClipboardDisplayers(next);
+  else clearClipboardDisplayers();
+  renderAnchors();
   renderHistory();
 }
 
+// Empty every displayer that is in "clipboard" mode, leaving default-image and sticky ones be.
+function clearClipboardDisplayers() {
+  state.displayers.forEach(displayer => {
+    if (state.settings.displayers[displayer.index].mode === 'clipboard') {
+      displayer.item = null;
+      resetTransform(displayer, false);
+    }
+  });
+  renderDisplayers();
+}
+
+// The grid is laid out column-first (see `grid-auto-flow: column` in styles.css), so Up/Down
+// step one cell within a column and Left/Right step a whole column — i.e. HISTORY_ROWS items.
 function moveSelection(direction) {
   const items = visibleHistoryItems();
   if (!items.length) return;
-  const index = Math.max(0, items.findIndex(item => item.id === state.selectedId));
-  const next = Math.min(items.length - 1, Math.max(0, index + direction));
+  const index = items.findIndex(item => item.id === state.selectedId);
+  // With nothing selected yet, the first press lands on an end item rather than skipping it.
+  const next = index < 0
+    ? (direction > 0 ? 0 : items.length - 1)
+    : clamp(index + direction, 0, items.length - 1);
   state.selectedAnchorId = null;
   state.selectedId = items[next].id;
   state.selectedItemSnapshot = items[next];
@@ -1227,13 +1295,7 @@ function deselectAll() {
   state.selectedAnchorId = null;
   state.selectedId = null;
   state.selectedItemSnapshot = null;
-  state.displayers.forEach(displayer => {
-    if (state.settings.displayers[displayer.index].mode === 'clipboard') {
-      displayer.item = null;
-      resetTransform(displayer, false);
-    }
-  });
-  renderDisplayers();
+  clearClipboardDisplayers();
   renderAnchors();
   renderHistory();
 }
@@ -1518,11 +1580,16 @@ function createAnchorEditor(anchor, index) {
   const emoji = document.createElement('input');
   emoji.type = 'text';
   emoji.className = 'emoji-input';
-  emoji.maxLength = 8;
+  // `maxLength` counts UTF-16 units, so a cap of 8 there rejects a single ZWJ emoji such as
+  // 👨‍👩‍👧‍👦 (11 units). Leave the element's own limit loose and enforce the real limit —
+  // 8 code points — in the input handler below.
+  emoji.maxLength = ANCHOR_EMOJI_MAX_CODE_POINTS * 4;
   emoji.value = anchor.emoji || '';
   emoji.title = 'Emoji';
   emoji.addEventListener('input', () => {
-    state.settings.attentionAnchors[index].emoji = emoji.value;
+    const trimmed = trimToCodePoints(emoji.value, ANCHOR_EMOJI_MAX_CODE_POINTS);
+    if (trimmed !== emoji.value) emoji.value = trimmed;
+    state.settings.attentionAnchors[index].emoji = trimmed;
     refreshEditor();
     updateAnchorsAfterLocalEdit();
   });
@@ -2142,6 +2209,14 @@ function bindKeyboard() {
       case 'ArrowDown':
         event.preventDefault();
         moveSelection(1);
+        break;
+      case 'ArrowLeft':
+        event.preventDefault();
+        moveSelection(-HISTORY_ROWS);
+        break;
+      case 'ArrowRight':
+        event.preventDefault();
+        moveSelection(HISTORY_ROWS);
         break;
       case 'Delete':
         event.preventDefault();

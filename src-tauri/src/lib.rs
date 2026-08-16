@@ -33,15 +33,19 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::DataExchange::{
-    AddClipboardFormatListener, GetClipboardSequenceNumber,
+    AddClipboardFormatListener, CloseClipboard, GetClipboardData, GetClipboardSequenceNumber,
+    IsClipboardFormatAvailable, OpenClipboard,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 #[cfg(windows)]
+use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
-    GetWindowRect, IsIconic, IsZoomed, PostQuitMessage, RegisterClassW, SetWindowLongPtrW,
-    TranslateMessage, GWLP_USERDATA, HWND_MESSAGE, MSG, WM_CLIPBOARDUPDATE, WM_DESTROY, WNDCLASSW,
+    GetWindowRect, IsIconic, IsZoomed, KillTimer, PostQuitMessage, RegisterClassW, SetTimer,
+    SetWindowLongPtrW, TranslateMessage, GWLP_USERDATA, HWND_MESSAGE, MSG, WM_CLIPBOARDUPDATE,
+    WM_DESTROY, WM_TIMER, WNDCLASSW,
 };
 
 const HISTORY_CACHE_DIR: &str = "clipboard-history";
@@ -85,6 +89,31 @@ const CLIPBOARD_COPY_RETRY_DELAY: Duration = Duration::from_millis(35);
 // revision (there is no periodic re-poll to fall back on anymore).
 const CLIPBOARD_READ_ATTEMPTS: usize = 6;
 const CLIPBOARD_READ_RETRY_DELAY: Duration = Duration::from_millis(20);
+// If every read attempt found the clipboard locked, the revision is NOT abandoned — a timer
+// on the listener window brings us back to it. Without that, a revision that happened to be
+// unreadable for ~120ms would be marked consumed and the clipboard's current contents would
+// never reach the history at all, since nothing else ever re-reads the clipboard.
+#[cfg(windows)]
+const CLIPBOARD_RECHECK_TIMER_ID: usize = 1;
+#[cfg(windows)]
+const CLIPBOARD_RECHECK_DELAY_MS: u32 = 200;
+#[cfg(windows)]
+const CLIPBOARD_RECHECK_MAX_ROUNDS: u32 = 25;
+// Attempts to open the clipboard for the native bitmap fallback (5ms apart).
+#[cfg(windows)]
+const CLIPBOARD_OPEN_ATTEMPTS: usize = 8;
+#[cfg(windows)]
+const CF_DIB: u32 = 8;
+#[cfg(windows)]
+const CF_DIBV5: u32 = 17;
+#[cfg(windows)]
+const BI_RGB: u32 = 0;
+#[cfg(windows)]
+const BI_BITFIELDS: u32 = 3;
+// Sanity ceiling for a DIB we will decode ourselves, so a corrupt header cannot make us
+// allocate an absurd buffer.
+#[cfg(windows)]
+const DIB_MAX_EDGE: u32 = 32768;
 
 #[cfg(windows)]
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
@@ -753,37 +782,321 @@ fn raw_file_image_from_paths(
         .map(RawClipboardItem::FileImage)
 }
 
-fn read_clipboard_raw(app: &AppHandle, sequence: u32) -> Result<Option<RawClipboardItem>, ()> {
-    let mut clipboard = Clipboard::new().map_err(|_| ())?;
-    let created_at = now_ms();
+/// What one look at the clipboard found. `Nothing` and `Unreadable` are deliberately
+/// distinct: the first means the clipboard genuinely holds no format this app supports and
+/// the revision is finished with, the second means someone else had the clipboard open and
+/// the revision must be tried again.
+enum ClipboardRead {
+    Item(Box<RawClipboardItem>),
+    Nothing,
+    Unreadable,
+}
 
-    if let Ok(image) = clipboard.get_image() {
-        return Ok(Some(RawClipboardItem::Image {
-            sequence,
-            created_at,
-            width: image.width,
-            height: image.height,
-            bytes: image.bytes.into_owned(),
-        }));
+#[cfg(windows)]
+struct ClipboardSession;
+
+#[cfg(windows)]
+impl ClipboardSession {
+    fn open() -> Option<Self> {
+        for _ in 0..CLIPBOARD_OPEN_ATTEMPTS {
+            if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+                return Some(Self);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        None
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ClipboardSession {
+    fn drop(&mut self) {
+        unsafe { CloseClipboard() };
+    }
+}
+
+#[cfg(windows)]
+fn dib_u32(data: &[u8], offset: usize) -> Option<u32> {
+    data.get(offset..offset + 4)
+        .map(|slice| u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+#[cfg(windows)]
+fn dib_i32(data: &[u8], offset: usize) -> Option<i32> {
+    dib_u32(data, offset).map(|value| value as i32)
+}
+
+#[cfg(windows)]
+fn dib_u16(data: &[u8], offset: usize) -> Option<u16> {
+    data.get(offset..offset + 2)
+        .map(|slice| u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+/// Extract one channel from a packed pixel using its BI_BITFIELDS mask, scaled to 8 bits.
+#[cfg(windows)]
+fn channel_from_mask(pixel: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 0;
+    }
+    let shift = mask.trailing_zeros();
+    let bits = (mask >> shift).count_ones();
+    let value = (pixel & mask) >> shift;
+    if bits >= 8 {
+        return (value >> (bits - 8)) as u8;
+    }
+    let max = (1u32 << bits) - 1;
+    ((value * 255 + max / 2) / max) as u8
+}
+
+/// Decode a packed DIB (BITMAPINFOHEADER / V4 / V5 followed by pixels) into top-down RGBA.
+///
+/// Only the 24- and 32-bit uncompressed layouts real clipboard producers use are handled;
+/// anything else returns `None` and is left to arboard.
+#[cfg(windows)]
+fn decode_dib(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let header_size = dib_u32(data, 0)? as usize;
+    if header_size < 40 || header_size > data.len() {
+        return None;
+    }
+    let width_raw = dib_i32(data, 4)?;
+    let height_raw = dib_i32(data, 8)?;
+    let bit_count = dib_u16(data, 14)?;
+    let compression = dib_u32(data, 16)?;
+    let colors_used = dib_u32(data, 32)?;
+
+    if width_raw <= 0 || height_raw == 0 || (bit_count != 24 && bit_count != 32) {
+        return None;
+    }
+    let width = u32::try_from(width_raw).ok()?;
+    // A negative height means the rows are already stored top-to-bottom.
+    let top_down = height_raw < 0;
+    let height = height_raw.unsigned_abs();
+    if width == 0 || height == 0 || width > DIB_MAX_EDGE || height > DIB_MAX_EDGE {
+        return None;
     }
 
-    if let Ok(paths) = clipboard.get().file_list() {
-        if let Some(item) = raw_file_image_from_paths(app, paths, sequence) {
-            return Ok(Some(item));
+    let (masks, extra_mask_bytes) = match compression {
+        BI_BITFIELDS => {
+            if header_size >= 108 {
+                // A V4/V5 header carries the masks inside itself, with nothing between the
+                // header and the pixels. (Mis-handling exactly this is what makes the
+                // `image` crate's BMP decoder — and therefore arboard — fail here.)
+                (
+                    Some([
+                        dib_u32(data, 40)?,
+                        dib_u32(data, 44)?,
+                        dib_u32(data, 48)?,
+                        dib_u32(data, 52)?,
+                    ]),
+                    0usize,
+                )
+            } else {
+                // A plain BITMAPINFOHEADER keeps them in the 12 bytes that follow it.
+                (
+                    Some([
+                        dib_u32(data, header_size)?,
+                        dib_u32(data, header_size + 4)?,
+                        dib_u32(data, header_size + 8)?,
+                        0,
+                    ]),
+                    12usize,
+                )
+            }
+        }
+        BI_RGB => (None, 0usize),
+        // RLE, or a JPEG/PNG smuggled inside a DIB.
+        _ => return None,
+    };
+
+    let palette_bytes = (colors_used as usize).saturating_mul(4);
+    let pixel_offset = header_size
+        .checked_add(extra_mask_bytes)?
+        .checked_add(palette_bytes)?;
+    let stride = (width as usize)
+        .checked_mul(bit_count as usize)?
+        .checked_add(31)?
+        / 32
+        * 4;
+    let needed = stride.checked_mul(height as usize)?;
+    if data.len() < pixel_offset.checked_add(needed)? {
+        return None;
+    }
+    let pixels = &data[pixel_offset..pixel_offset + needed];
+
+    let mut rgba = vec![0u8; (width as usize).checked_mul(height as usize)?.checked_mul(4)?];
+    let mut any_alpha = false;
+    for row in 0..height as usize {
+        let source_row = if top_down {
+            row
+        } else {
+            height as usize - 1 - row
+        };
+        let source = &pixels[source_row * stride..source_row * stride + stride];
+        for column in 0..width as usize {
+            let destination = (row * width as usize + column) * 4;
+            if bit_count == 24 {
+                let offset = column * 3;
+                rgba[destination] = source[offset + 2];
+                rgba[destination + 1] = source[offset + 1];
+                rgba[destination + 2] = source[offset];
+                rgba[destination + 3] = 255;
+                continue;
+            }
+            let offset = column * 4;
+            let (red, green, blue, alpha) = match masks {
+                Some([red_mask, green_mask, blue_mask, alpha_mask]) => {
+                    let packed = u32::from_le_bytes([
+                        source[offset],
+                        source[offset + 1],
+                        source[offset + 2],
+                        source[offset + 3],
+                    ]);
+                    (
+                        channel_from_mask(packed, red_mask),
+                        channel_from_mask(packed, green_mask),
+                        channel_from_mask(packed, blue_mask),
+                        channel_from_mask(packed, alpha_mask),
+                    )
+                }
+                // BI_RGB documents the top byte as unused, but every browser-class producer
+                // puts real transparency there, so read it and let the all-zero check below
+                // sort out the ones that meant it as padding.
+                None => (
+                    source[offset + 2],
+                    source[offset + 1],
+                    source[offset],
+                    source[offset + 3],
+                ),
+            };
+            rgba[destination] = red;
+            rgba[destination + 1] = green;
+            rgba[destination + 2] = blue;
+            rgba[destination + 3] = alpha;
+            if alpha != 0 {
+                any_alpha = true;
+            }
         }
     }
 
-    if let Ok(text) = clipboard.get_text() {
-        if let Some(item) = text_item(sequence, created_at, text) {
-            return Ok(Some(RawClipboardItem::Text {
+    // A 32-bit DIB whose alpha plane is entirely zero came from a producer that never filled
+    // the byte in. Taking it literally would store a fully invisible image, so treat it as
+    // opaque — a genuinely all-transparent image carries no information to lose either way.
+    if bit_count == 32 && !any_alpha {
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+    }
+    Some((width, height, rgba))
+}
+
+/// Read the clipboard's bitmap straight from CF_DIBV5/CF_DIB.
+///
+/// This exists because arboard decodes CF_DIBV5 through the `image` crate's BMP decoder,
+/// which — for a V4/V5 header using BI_BITFIELDS — seeks 12 bytes past the header looking for
+/// a repeated RGB mask triple that is only present after a plain BITMAPINFOHEADER. The pixel
+/// data is then read out of alignment and the decode fails. That header shape is exactly what
+/// browsers and screenshot tools publish for an image carrying an alpha channel, and arboard's
+/// error for it is indistinguishable from "no image here", so such copies were silently
+/// dropped instead of entering the history.
+#[cfg(windows)]
+fn read_clipboard_dib() -> Option<(u32, u32, Vec<u8>)> {
+    let _session = ClipboardSession::open()?;
+    for format in [CF_DIBV5, CF_DIB] {
+        if unsafe { IsClipboardFormatAvailable(format) } == 0 {
+            continue;
+        }
+        let handle = unsafe { GetClipboardData(format) };
+        if handle.is_null() {
+            continue;
+        }
+        let size = unsafe { GlobalSize(handle) };
+        if size < 40 {
+            continue;
+        }
+        let pointer = unsafe { GlobalLock(handle) } as *const u8;
+        if pointer.is_null() {
+            continue;
+        }
+        let decoded = decode_dib(unsafe { std::slice::from_raw_parts(pointer, size) });
+        unsafe { GlobalUnlock(handle) };
+        if decoded.is_some() {
+            return decoded;
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn read_clipboard_dib() -> Option<(u32, u32, Vec<u8>)> {
+    None
+}
+
+fn read_clipboard_raw(app: &AppHandle, sequence: u32) -> ClipboardRead {
+    let Ok(mut clipboard) = Clipboard::new() else {
+        return ClipboardRead::Unreadable;
+    };
+    let created_at = now_ms();
+    // Set whenever a read failed because another process had the clipboard open, so the
+    // caller can tell "nothing to capture" apart from "come back and try again".
+    let mut occupied = false;
+
+    match clipboard.get_image() {
+        Ok(image) => {
+            return ClipboardRead::Item(Box::new(RawClipboardItem::Image {
                 sequence,
                 created_at,
-                text: item.text.unwrap_or_default(),
-            }));
+                width: image.width,
+                height: image.height,
+                bytes: image.bytes.into_owned(),
+            }))
+        }
+        // No bitmap at all — the common case for text; nothing to fall back to.
+        Err(arboard::Error::ContentNotAvailable) => {}
+        Err(arboard::Error::ClipboardOccupied) => occupied = true,
+        // A bitmap IS there and arboard could not turn it into an image. Decode it ourselves
+        // rather than losing the copy.
+        Err(_) => {
+            if let Some((width, height, bytes)) = read_clipboard_dib() {
+                return ClipboardRead::Item(Box::new(RawClipboardItem::Image {
+                    sequence,
+                    created_at,
+                    width: width as usize,
+                    height: height as usize,
+                    bytes,
+                }));
+            }
         }
     }
 
-    Ok(None)
+    match clipboard.get().file_list() {
+        Ok(paths) => {
+            if let Some(item) = raw_file_image_from_paths(app, paths, sequence) {
+                return ClipboardRead::Item(Box::new(item));
+            }
+        }
+        Err(arboard::Error::ClipboardOccupied) => occupied = true,
+        Err(_) => {}
+    }
+
+    match clipboard.get_text() {
+        Ok(text) => {
+            if let Some(item) = text_item(sequence, created_at, text) {
+                return ClipboardRead::Item(Box::new(RawClipboardItem::Text {
+                    sequence,
+                    created_at,
+                    text: item.text.unwrap_or_default(),
+                }));
+            }
+        }
+        Err(arboard::Error::ClipboardOccupied) => occupied = true,
+        Err(_) => {}
+    }
+
+    if occupied {
+        ClipboardRead::Unreadable
+    } else {
+        ClipboardRead::Nothing
+    }
 }
 
 fn raw_to_clipboard_item(app: &AppHandle, raw: RawClipboardItem) -> Option<ClipboardItem> {
@@ -862,14 +1175,18 @@ fn start_clipboard_watcher(app: AppHandle) {
 /// Read the current clipboard revision once and forward it, retrying briefly through transient
 /// read failures (another process can still hold the clipboard open right after it changed).
 /// `last_sequence` is updated so the same revision is never captured twice.
+///
+/// Returns `false` when the revision is still unread because the clipboard stayed locked. The
+/// caller must then arrange to come back to it — `last_sequence` is deliberately left alone in
+/// that case, so nothing marks the revision as dealt with.
 fn capture_clipboard_revision(
     app: &AppHandle,
     sender: &mpsc::Sender<RawClipboardItem>,
     last_sequence: &mut u32,
-) {
+) -> bool {
     let sequence = clipboard_sequence();
     if sequence == 0 || sequence == *last_sequence {
-        return;
+        return true;
     }
 
     let state = app.state::<AppState>();
@@ -877,27 +1194,28 @@ fn capture_clipboard_revision(
         || take_ignored_clipboard_sequence(app, sequence)
     {
         *last_sequence = sequence;
-        return;
+        return true;
     }
 
     for attempt in 0..CLIPBOARD_READ_ATTEMPTS {
         match read_clipboard_raw(app, sequence) {
-            Ok(item) => {
-                if let Some(item) = item {
-                    let _ = sender.send(item);
-                }
+            ClipboardRead::Item(item) => {
+                let _ = sender.send(*item);
                 *last_sequence = sequence;
-                return;
+                return true;
             }
-            Err(()) => {
+            ClipboardRead::Nothing => {
+                *last_sequence = sequence;
+                return true;
+            }
+            ClipboardRead::Unreadable => {
                 if attempt + 1 < CLIPBOARD_READ_ATTEMPTS {
                     thread::sleep(CLIPBOARD_READ_RETRY_DELAY);
                 }
             }
         }
     }
-    // Still locked after every attempt; skip this revision rather than spin.
-    *last_sequence = sequence;
+    false
 }
 
 #[cfg(windows)]
@@ -905,6 +1223,45 @@ struct ClipboardListenerContext {
     app: AppHandle,
     sender: mpsc::Sender<RawClipboardItem>,
     last_sequence: u32,
+    /// How many times in a row we have rescheduled a read of the same unread revision.
+    recheck_rounds: u32,
+}
+
+/// Run a capture and, if the clipboard was locked throughout, arrange to come back to it.
+///
+/// The listener is purely event-driven, so a revision that is dropped here is dropped for
+/// good: no later notification arrives for content that is already on the clipboard. A
+/// one-shot timer on the listener window is what keeps that from happening, and it is only
+/// ever armed while a read is outstanding, so an idle app still costs nothing.
+#[cfg(windows)]
+fn capture_or_reschedule(hwnd: HWND, context: &mut ClipboardListenerContext) {
+    let settled = capture_clipboard_revision(
+        &context.app,
+        &context.sender,
+        &mut context.last_sequence,
+    );
+    if settled {
+        context.recheck_rounds = 0;
+        unsafe { KillTimer(hwnd, CLIPBOARD_RECHECK_TIMER_ID) };
+        return;
+    }
+    if context.recheck_rounds >= CLIPBOARD_RECHECK_MAX_ROUNDS {
+        // Whoever holds the clipboard is not letting go. Stop retrying so the listener
+        // thread is free for the next real change.
+        context.recheck_rounds = 0;
+        context.last_sequence = clipboard_sequence();
+        unsafe { KillTimer(hwnd, CLIPBOARD_RECHECK_TIMER_ID) };
+        return;
+    }
+    context.recheck_rounds += 1;
+    unsafe {
+        SetTimer(
+            hwnd,
+            CLIPBOARD_RECHECK_TIMER_ID,
+            CLIPBOARD_RECHECK_DELAY_MS,
+            None,
+        )
+    };
 }
 
 /// Event-driven clipboard capture: a hidden message-only window subscribes via
@@ -948,6 +1305,7 @@ fn clipboard_watch_loop(app: AppHandle, sender: mpsc::Sender<RawClipboardItem>) 
             app,
             sender,
             last_sequence: 0,
+            recheck_rounds: 0,
         });
         let context = Box::into_raw(context);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, context as isize);
@@ -959,11 +1317,7 @@ fn clipboard_watch_loop(app: AppHandle, sender: mpsc::Sender<RawClipboardItem>) 
         }
 
         // Capture whatever is already on the clipboard at launch (no update event fires for it).
-        capture_clipboard_revision(
-            &(*context).app,
-            &(*context).sender,
-            &mut (*context).last_sequence,
-        );
+        capture_or_reschedule(hwnd, &mut *context);
 
         let mut message: MSG = std::mem::zeroed();
         while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
@@ -988,11 +1342,17 @@ unsafe extern "system" fn clipboard_wndproc(
             let context =
                 GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ClipboardListenerContext;
             if let Some(context) = context.as_mut() {
-                capture_clipboard_revision(
-                    &context.app,
-                    &context.sender,
-                    &mut context.last_sequence,
-                );
+                capture_or_reschedule(hwnd, context);
+            }
+            0
+        }
+        // Only ever armed by `capture_or_reschedule` after a read found the clipboard locked.
+        WM_TIMER if wparam == CLIPBOARD_RECHECK_TIMER_ID => {
+            KillTimer(hwnd, CLIPBOARD_RECHECK_TIMER_ID);
+            let context =
+                GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ClipboardListenerContext;
+            if let Some(context) = context.as_mut() {
+                capture_or_reschedule(hwnd, context);
             }
             0
         }
@@ -1414,6 +1774,17 @@ fn save_hidden_history(app: AppHandle, items: Vec<ClipboardItem>) -> Result<(), 
     fs::write(path, data).map_err(|error| format!("Failed to save hidden history: {error}"))
 }
 
+/// Whether a saved history entry is still usable. An image entry points at a file in the
+/// clipboard cache, and that cache is wiped at startup and trimmed while running, so a saved
+/// entry easily outlives the file it names. Restoring one of those puts a tile in the grid
+/// that can never render and can never be copied back, so they are dropped on the way in.
+fn history_item_file_present(item: &ClipboardItem) -> bool {
+    match item.file_path.as_deref() {
+        Some(path) => Path::new(path).is_file(),
+        None => true,
+    }
+}
+
 #[tauri::command]
 fn load_hidden_history(app: AppHandle) -> Result<Vec<ClipboardItem>, String> {
     let path = hidden_history_path(&app)?;
@@ -1422,8 +1793,45 @@ fn load_hidden_history(app: AppHandle) -> Result<Vec<ClipboardItem>, String> {
     }
     let data = fs::read_to_string(path)
         .map_err(|error| format!("Failed to read hidden history: {error}"))?;
-    serde_json::from_str::<Vec<ClipboardItem>>(&data)
-        .map_err(|error| format!("Failed to parse hidden history: {error}"))
+    let items = serde_json::from_str::<Vec<ClipboardItem>>(&data)
+        .map_err(|error| format!("Failed to parse hidden history: {error}"))?;
+    Ok(items
+        .into_iter()
+        .filter(history_item_file_present)
+        .collect())
+}
+
+/// Drop saved hidden-history entries whose cached images are gone. Called right after the
+/// startup cache wipe, which is what orphans them in the first place.
+fn prune_hidden_history(app: &AppHandle) {
+    let Ok(path) = hidden_history_path(app) else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+    let Ok(data) = fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(items) = serde_json::from_str::<Vec<ClipboardItem>>(&data) else {
+        let _ = fs::remove_file(&path);
+        return;
+    };
+    let total = items.len();
+    let kept: Vec<ClipboardItem> = items
+        .into_iter()
+        .filter(history_item_file_present)
+        .collect();
+    if kept.len() == total {
+        return;
+    }
+    if kept.is_empty() {
+        let _ = fs::remove_file(&path);
+        return;
+    }
+    if let Ok(data) = serde_json::to_string_pretty(&kept) {
+        let _ = fs::write(&path, data);
+    }
 }
 
 #[tauri::command]
@@ -1860,9 +2268,33 @@ fn open_path_in_default_app(_path: &Path) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        // Must be registered first. Without it a second launch (a re-clicked shortcut, a
+        // startup entry firing while the app is already up) starts a rival process that
+        // wipes the running instance's image cache in `setup` below — every preview in the
+        // live window goes blank and those items can no longer be copied back — and then
+        // sits there as a windowless process, because WebView2 will not hand a second
+        // process the same user-data folder. The second launch now hands over and exits
+        // before any of that runs.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // Do NOT build a window here. This callback runs synchronously inside the
+            // WM_COPYDATA window procedure while the launching process is blocked in
+            // SendMessageW, and building a webview starts a nested message pump inside it
+            // that deadlocks both processes. Surfacing the window that already exists is
+            // all that is wanted, and it is moved off this thread so the launcher is
+            // released immediately.
+            let app = app.clone();
+            thread::spawn(move || {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            });
+        }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             clean_history_cache(app.handle());
+            prune_hidden_history(app.handle());
             start_clipboard_watcher(app.handle().clone());
             if let Some(window) = app.get_webview_window("main") {
                 square_window_corners(&window);
@@ -1933,6 +2365,16 @@ pub fn run() {
             window_show,
             window_start_drag
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // Backstop against outliving our own window. Nothing here holds a runtime handle
+            // past teardown today (both long-lived threads use raw Win32 or non-blocking
+            // event emission), but a future one that blocked on the event loop would leave a
+            // windowless process pinning its own exe — and the next `tauri build` failing
+            // with "os error 5".
+            if let tauri::RunEvent::Exit = event {
+                std::process::exit(0);
+            }
+        });
 }

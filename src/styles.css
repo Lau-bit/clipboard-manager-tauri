@@ -842,6 +842,32 @@ body.mirrored #anchor-column {
   background: var(--accent-soft);
 }
 
+/* The cached file behind an image item can disappear (the cache is wiped at startup and
+   trimmed as it grows). Say so, rather than leaving a cell that looks merely empty. */
+.history-item.missing-image::after,
+.displayer.missing-image .displayer-content::after {
+  content: "⃠";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #6b5560;
+  font-size: 22px;
+  pointer-events: none;
+}
+
+.history-item.missing-image {
+  position: relative;
+  background: repeating-linear-gradient(
+    45deg,
+    #151013,
+    #151013 6px,
+    #191216 6px,
+    #191216 12px
+  );
+}
+
 .history-thumb {
   width: 100%;
   height: 100%;
